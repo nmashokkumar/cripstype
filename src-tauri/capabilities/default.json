@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default desktop capabilities for CrispType main and floating overlay windows",
+  "windows": ["main", "overlay"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "global-shortcut:default",
+    "autostart:default"
+  ]
+}

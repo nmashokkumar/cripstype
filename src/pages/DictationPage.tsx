@@ -199,7 +199,7 @@ export function DictationPage() {
                 Working around other people?
               </h2>
               <p className="mt-1.5 text-[13.5px] text-white/85 max-w-[480px] leading-relaxed">
-                With the right setup, you can Flow without disrupting your neighbors
+                With the right setup, you can dictate with CrispType without disrupting your neighbors
               </p>
 
               <div className="mt-5">
@@ -623,7 +623,7 @@ export function DictationPage() {
                 <kbd className="rounded bg-[var(--flow-surface-muted)] border border-[var(--flow-border)] px-1.5 py-0.5 text-[12px] text-[var(--flow-text)]">
                   {settings.handsFreeHotkey.label}
                 </kbd>{' '}
-                for longer notes. Flow stops automatically after {settings.silenceTimeoutSec || 5}s of silence.
+                for longer notes. CrispType stops automatically after {settings.silenceTimeoutSec || 5}s of silence.
               </li>
               <li>
                 <strong className="text-[var(--flow-text)]">3. Choose a close-field mic:</strong> Pick your headset or

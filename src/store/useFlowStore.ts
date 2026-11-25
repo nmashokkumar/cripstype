@@ -67,6 +67,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   micDeviceId: 'default',
   silenceTimeoutSec: 5,
   mockMode: false,
+  launchAtStartup: true,
+  minimizeToTray: true,
   theme: 'light',
 };
 
@@ -103,6 +105,25 @@ const overlayChannel =
   typeof window !== 'undefined' && 'BroadcastChannel' in window
     ? new BroadcastChannel('flow-overlay-sync')
     : null;
+
+function isOverlayWindowContext(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.location.pathname.replace(/\/+$/, '') === '/overlay';
+}
+
+export type OverlayCommandAction = 'stop' | 'cancel' | 'clearError';
+
+/**
+ * Relays user clicks inside the standalone /overlay floating window (e.g. clicking ✓
+ * or dismissing an error) back to the main hidden/tray window that owns the mic stream.
+ */
+export function sendOverlayCommand(action: OverlayCommandAction): void {
+  overlayChannel?.postMessage({ type: 'command', action });
+  const tauriEmit = typeof window !== 'undefined' ? window.__TAURI__?.event?.emit : undefined;
+  if (typeof tauriEmit === 'function') {
+    void tauriEmit('crisptype:overlay-command', { action }).catch(() => undefined);
+  }
+}
 
 interface DismissedBanners {
   dictationTips: boolean;
@@ -197,7 +218,6 @@ function loadInitialSettings(): AppSettings {
   let serverUrl = raw.serverUrl || getDefaultServerUrl();
   let silenceTimeoutSec =
     typeof raw.silenceTimeoutSec === 'number' ? raw.silenceTimeoutSec : 5;
-  let mockMode = Boolean(raw.mockMode);
 
   if (typeof window !== 'undefined' && !window.localStorage.getItem(SETTINGS_MIGRATION_V2_KEY)) {
     const looksLikeOldDefault =
@@ -207,7 +227,6 @@ function loadInitialSettings(): AppSettings {
       serverUrl === window.location.origin;
     if (looksLikeOldDefault) {
       serverUrl = LIVE_SEAMLESS_SERVER_URL;
-      mockMode = false;
     }
     if (silenceTimeoutSec === 3) {
       silenceTimeoutSec = 5;
@@ -218,13 +237,15 @@ function loadInitialSettings(): AppSettings {
   const normalized: AppSettings = {
     serverUrl,
     apiKey: typeof raw.apiKey === 'string' ? raw.apiKey : '',
-    asrModel: raw.asrModel || 'auto',
+    asrModel: 'auto',
     pushToTalkHotkey: raw.pushToTalkHotkey?.code ? raw.pushToTalkHotkey : DEFAULT_PTT_HOTKEY,
     handsFreeHotkey: raw.handsFreeHotkey?.code ? raw.handsFreeHotkey : DEFAULT_HANDS_FREE_HOTKEY,
     dictationMode: raw.dictationMode === 'hands_free' ? 'hands_free' : 'push_to_talk',
     micDeviceId: typeof raw.micDeviceId === 'string' ? raw.micDeviceId : 'default',
     silenceTimeoutSec,
-    mockMode,
+    mockMode: false,
+    launchAtStartup: typeof raw.launchAtStartup === 'boolean' ? raw.launchAtStartup : true,
+    minimizeToTray: typeof raw.minimizeToTray === 'boolean' ? raw.minimizeToTray : true,
     theme: raw.theme === 'dark' ? 'dark' : 'light',
   };
 
@@ -241,35 +262,76 @@ export const useFlowStore = create<FlowState>((set, get) => {
       (s.overlayState === 'listening' &&
         (s.activeRecordingMode ?? s.settings.dictationMode) === 'hands_free') ||
       s.overlayState === 'error';
+
+    if (!isOverlayWindowContext()) {
+      platform.setOverlayVisible(s.overlayState !== 'idle');
+    }
     platform.setOverlayInteractive(shouldAllowClicks);
 
-    if (!overlayChannel) return;
-    overlayChannel.postMessage({
-      type: 'state',
+    const payload = {
+      type: 'state' as const,
       overlayState: s.overlayState,
       activeStage: s.activeStage,
       activeRecordingMode: s.activeRecordingMode,
       recordingElapsedMs: s.recordingElapsedMs,
       audioLevels: s.audioLevels,
       overlayError: s.overlayError,
-    });
+    };
+
+    overlayChannel?.postMessage(payload);
+    const tauriEmit = typeof window !== 'undefined' ? window.__TAURI__?.event?.emit : undefined;
+    if (!isOverlayWindowContext() && typeof tauriEmit === 'function') {
+      void tauriEmit('crisptype:overlay-state', payload).catch(() => undefined);
+    }
+  };
+
+  const applyRemoteOverlayMessage = (msg: Record<string, unknown>) => {
+    if (msg.type === 'state') {
+      set({
+        overlayState: msg.overlayState as DictationOverlayState,
+        activeStage: (msg.activeStage as DictationStage) ?? 'record',
+        activeRecordingMode: (msg.activeRecordingMode as DictationMode | null) ?? null,
+        recordingElapsedMs: typeof msg.recordingElapsedMs === 'number' ? msg.recordingElapsedMs : 0,
+        audioLevels: Array.isArray(msg.audioLevels) ? (msg.audioLevels as number[]) : Array(10).fill(0.18),
+        overlayError: typeof msg.overlayError === 'string' ? msg.overlayError : null,
+      });
+      return;
+    }
+    if (msg.type === 'command' && !isOverlayWindowContext()) {
+      if (msg.action === 'stop') {
+        void get().stopDictation();
+      } else if (msg.action === 'cancel') {
+        get().cancelDictation();
+      } else if (msg.action === 'clearError') {
+        get().clearOverlayError();
+      }
+    }
   };
 
   if (overlayChannel) {
     overlayChannel.onmessage = (event) => {
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
-      if (msg.type === 'state') {
-        set({
-          overlayState: msg.overlayState,
-          activeStage: msg.activeStage,
-          activeRecordingMode: msg.activeRecordingMode ?? null,
-          recordingElapsedMs: typeof msg.recordingElapsedMs === 'number' ? msg.recordingElapsedMs : 0,
-          audioLevels: msg.audioLevels,
-          overlayError: msg.overlayError,
-        });
-      }
+      applyRemoteOverlayMessage(msg as Record<string, unknown>);
     };
+  }
+
+  // Also bridge Tauri cross-window events so main <-> overlay stay synced across isolated webviews
+  if (typeof window !== 'undefined' && typeof window.__TAURI__?.event?.listen === 'function') {
+    const listen = window.__TAURI__.event.listen;
+    if (isOverlayWindowContext()) {
+      void listen<Record<string, unknown>>('crisptype:overlay-state', (ev) => {
+        if (ev.payload && typeof ev.payload === 'object') {
+          applyRemoteOverlayMessage(ev.payload);
+        }
+      }).catch(() => undefined);
+    } else {
+      void listen<{ action?: OverlayCommandAction }>('crisptype:overlay-command', (ev) => {
+        if (ev.payload?.action) {
+          applyRemoteOverlayMessage({ type: 'command', action: ev.payload.action });
+        }
+      }).catch(() => undefined);
+    }
   }
 
   return {
@@ -311,11 +373,11 @@ export const useFlowStore = create<FlowState>((set, get) => {
 
     updateSettings: (partial) =>
       set((state) => {
-        const next = { ...state.settings, ...partial };
+        const next = { ...state.settings, ...partial, mockMode: false };
         writeJson(SETTINGS_KEY, next);
         if (
-          (partial.micDeviceId !== undefined && partial.micDeviceId !== state.settings.micDeviceId) ||
-          partial.mockMode === true
+          partial.micDeviceId !== undefined &&
+          partial.micDeviceId !== state.settings.micDeviceId
         ) {
           audioController.releaseWarmPipeline();
         }
@@ -324,6 +386,18 @@ export const useFlowStore = create<FlowState>((set, get) => {
             pushToTalk: next.pushToTalkHotkey,
             handsFree: next.handsFreeHotkey,
           });
+        }
+        if (
+          partial.launchAtStartup !== undefined &&
+          partial.launchAtStartup !== state.settings.launchAtStartup
+        ) {
+          void platform.setAutoStart(next.launchAtStartup);
+        }
+        if (
+          partial.minimizeToTray !== undefined &&
+          partial.minimizeToTray !== state.settings.minimizeToTray
+        ) {
+          void platform.setMinimizeToTray(next.minimizeToTray);
         }
         return { settings: next };
       }),

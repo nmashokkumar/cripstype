@@ -1,5 +1,5 @@
 import { Check, X } from 'lucide-react';
-import { useFlowStore } from '../store/useFlowStore';
+import { sendOverlayCommand, useFlowStore } from '../store/useFlowStore';
 import { formatElapsedTimer } from '../utils/pcmAudio';
 
 interface OverlayPillProps {
@@ -33,6 +33,22 @@ export function OverlayPill({ standalone = false }: OverlayPillProps) {
 
   const effectiveMode = activeRecordingMode ?? fallbackMode;
   const isHandsFree = effectiveMode === 'hands_free';
+
+  const handleFinish = () => {
+    if (standalone) {
+      sendOverlayCommand('stop');
+    } else {
+      void stopDictation();
+    }
+  };
+
+  const handleDismissError = () => {
+    if (standalone) {
+      sendOverlayCommand('clearError');
+    } else {
+      clearOverlayError();
+    }
+  };
 
   const containerClass = standalone
     ? 'fixed inset-0 flex items-end justify-center pb-6 pointer-events-none'
@@ -92,7 +108,7 @@ export function OverlayPill({ standalone = false }: OverlayPillProps) {
 
             <button
               type="button"
-              onClick={() => void stopDictation()}
+              onClick={handleFinish}
               aria-label="Finish and paste dictation"
               title="Finish & paste"
               className="flex items-center justify-center w-7 h-7 rounded-full bg-white/12 hover:bg-emerald-500 text-white transition-colors cursor-pointer"
@@ -141,7 +157,7 @@ export function OverlayPill({ standalone = false }: OverlayPillProps) {
             </span>
             <button
               type="button"
-              onClick={clearOverlayError}
+              onClick={handleDismissError}
               aria-label="Dismiss error"
               className="p-0.5 rounded-full text-white/65 hover:text-white cursor-pointer shrink-0"
             >

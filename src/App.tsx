@@ -42,14 +42,18 @@ export default function App() {
     }
   }, [settings.theme]);
 
-  // Load IndexedDB history and custom dictionary on startup + sync hotkeys with native wrapper
+  // Load IndexedDB history and custom dictionary on startup + sync native tray/autostart/hotkeys
   useEffect(() => {
     void initHistory();
     void initDictionary();
-    platform.syncNativeHotkeys({
-      pushToTalk: settings.pushToTalkHotkey,
-      handsFree: settings.handsFreeHotkey,
-    });
+    if (!isOverlayPathname()) {
+      platform.syncNativeHotkeys({
+        pushToTalk: settings.pushToTalkHotkey,
+        handsFree: settings.handsFreeHotkey,
+      });
+      void platform.setMinimizeToTray(settings.minimizeToTray);
+      void platform.setAutoStart(settings.launchAtStartup);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initHistory, initDictionary]);
 

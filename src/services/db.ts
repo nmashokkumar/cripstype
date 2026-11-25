@@ -69,7 +69,7 @@ export const DEFAULT_DICTIONARY_ENTRIES: DictionaryEntry[] = [
   {
     id: 'dict-4',
     type: 'word',
-    trigger: 'Wispr Flow',
+    trigger: 'CrispType',
     starred: false,
     scope: 'personal',
     createdAt: Date.now() - 400000,

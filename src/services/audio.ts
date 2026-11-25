@@ -70,6 +70,48 @@ export async function listAudioInputDevices(): Promise<MicDeviceOption[]> {
 }
 
 /**
+ * Requests microphone-only permission (`video: false`) so OS/WebKitGTK dialogs
+ * never ask for camera access, then releases the probe track immediately.
+ */
+export async function requestMicrophonePermission(): Promise<{
+  granted: boolean;
+  message: string;
+}> {
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+    return {
+      granted: false,
+      message: 'Microphone access is unavailable in this environment.',
+    };
+  }
+  try {
+    const probeStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
+    probeStream.getTracks().forEach((track) => track.stop());
+    return { granted: true, message: 'Microphone access granted' };
+  } catch (err) {
+    const name = err instanceof DOMException ? err.name : '';
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+      return {
+        granted: false,
+        message: 'Microphone permission was denied in system settings.',
+      };
+    }
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      return {
+        granted: false,
+        message: 'No microphone was found on this device.',
+      };
+    }
+    return {
+      granted: false,
+      message: err instanceof Error ? err.message : 'Unable to access microphone.',
+    };
+  }
+}
+
+/**
  * Plays a crisp, subtle two-tone Web Audio completion chime when final text is pasted.
  */
 export function playCompletionChime(): void {
@@ -230,6 +272,7 @@ export class AudioCaptureController {
         requestedDeviceId !== 'default'
           ? { ...baseAudioConstraints, deviceId: { exact: requestedDeviceId } }
           : baseAudioConstraints,
+      video: false,
     };
 
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -404,7 +447,7 @@ export class AudioCaptureController {
         throw new Error('Microphone permission denied. Allow mic access in your browser or OS settings.');
       }
       if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-        throw new Error('No microphone detected. Connect a microphone or enable Mock mode in Settings.');
+        throw new Error('No microphone detected. Connect a microphone and check your audio settings.');
       }
       throw new Error(err instanceof Error ? err.message : 'Unable to access microphone.');
     }

@@ -14,7 +14,7 @@ import { useFlowStore } from '../store/useFlowStore';
 import { parseDictionaryImport, serializeDictionaryExport } from '../utils/textPipeline';
 import type { DictionaryEntry } from '../types';
 
-const SUGGESTION_CHIPS = ['Wispr Flow', 'Samir', 'Sara', 'Karol', 'Spyder'];
+const SUGGESTION_CHIPS = ['CrispType', 'Samir', 'Sara', 'Karol', 'Spyder'];
 
 export function DictionaryPage() {
   const dictionary = useFlowStore((s) => s.dictionary);
@@ -191,7 +191,7 @@ export function DictionaryPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `flow-dictionary.${format}`;
+    a.download = `crisptype-dictionary.${format}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -333,7 +333,7 @@ export function DictionaryPage() {
           </button>
 
           <h2 className="font-serif-display text-[26px] md:text-[28px] font-normal tracking-[-0.01em] text-white leading-snug pr-8">
-            Flow spells the way <em className="italic">you</em> do.
+            CrispType spells the way <em className="italic">you</em> do.
           </h2>
           <p className="mt-2 text-[13.5px] text-white/85 max-w-[610px] leading-relaxed">
             Correct a spelling once or add it here manually, so your{' '}
@@ -521,7 +521,7 @@ export function DictionaryPage() {
                   }}
                   placeholder={
                     entryType === 'word'
-                      ? 'e.g. Kubernetes, Wispr Flow, Stewart Gauld'
+                      ? 'e.g. Kubernetes, CrispType, Stewart Gauld'
                       : 'e.g. btw, k8s, hii'
                   }
                   autoFocus

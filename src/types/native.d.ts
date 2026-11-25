@@ -23,6 +23,16 @@ export interface FlowNativeBridge {
   copyText?: (text: string) => Promise<boolean>;
   /** Toggle click-through on a frameless floating overlay window (must remain interactive during hands-free) */
   setOverlayIgnoreMouseEvents?: (ignore: boolean, options?: { forward?: boolean }) => void;
+  /** Show or hide the floating always-on-top overlay window */
+  setOverlayVisible?: (visible: boolean) => Promise<void> | void;
+  /** Enable or disable OS login autostart */
+  setAutoStart?: (enabled: boolean) => Promise<boolean> | void;
+  /** Query current OS login autostart state */
+  getAutoStart?: () => Promise<boolean>;
+  /** Keep app running in system tray when main window is closed */
+  setMinimizeToTray?: (enabled: boolean) => Promise<void> | void;
+  /** Reveal and focus the main desktop window */
+  showMainWindow?: () => Promise<void> | void;
   /** Sync user-configured shortcuts with the native global hotkey daemon */
   updateHotkeys?: (bindings: { pushToTalk: HotkeyBinding; handsFree: HotkeyBinding }) => void;
   /** Subscribe to global native hotkey triggers; returns an unsubscribe callback */
@@ -39,6 +49,10 @@ export interface ElectronLegacyAPI {
   getActiveApp?: () => Promise<NativeActiveAppInfo | string | null>;
   pasteText?: (text: string) => Promise<boolean>;
   setIgnoreMouseEvents?: (ignore: boolean, options?: { forward?: boolean }) => void;
+  setOverlayVisible?: (visible: boolean) => Promise<void> | void;
+  setAutoStart?: (enabled: boolean) => Promise<boolean> | void;
+  getAutoStart?: () => Promise<boolean>;
+  setMinimizeToTray?: (enabled: boolean) => Promise<void> | void;
   updateHotkeys?: (bindings: { pushToTalk?: string; handsFree?: string }) => void;
   onDictationStart?: (cb: (mode?: 'push_to_talk' | 'hands_free') => void) => (() => void) | void;
   onDictationStop?: (cb: () => void) => (() => void) | void;
@@ -46,10 +60,38 @@ export interface ElectronLegacyAPI {
   onOpenSettings?: (cb: () => void) => (() => void) | void;
 }
 
+/**
+ * Runtime Tauri v2 global bridge injected when `withGlobalTauri: true` is configured
+ * in `src-tauri/tauri.conf.json`. Using global runtime detection keeps the web build
+ * free of native-only bundle dependencies.
+ */
+export interface TauriInternalsBridge {
+  invoke?: <T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+}
+
+export interface TauriEventUnlisten {
+  (): void;
+}
+
+export interface TauriGlobalBridge {
+  core?: {
+    invoke?: <T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+  };
+  event?: {
+    listen?: <T = unknown>(
+      event: string,
+      handler: (event: { payload: T }) => void
+    ) => Promise<TauriEventUnlisten>;
+    emit?: (event: string, payload?: unknown) => Promise<void>;
+  };
+}
+
 declare global {
   interface Window {
     flowNative?: FlowNativeBridge;
     electronAPI?: ElectronLegacyAPI;
+    __TAURI_INTERNALS__?: TauriInternalsBridge;
+    __TAURI__?: TauriGlobalBridge;
   }
 }
 

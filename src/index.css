@@ -2,6 +2,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
+  color-scheme: light;
   --flow-app-bg: #F4F3EE;
   --flow-panel-bg: #FAFAF8;
   --flow-surface: #FFFFFF;
@@ -30,6 +31,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --flow-app-bg: #121211;
   --flow-panel-bg: #191917;
   --flow-surface: #20201D;
@@ -65,6 +67,21 @@
     color: var(--flow-text);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Ensure WebKitGTK / Linux native selects & inputs always follow light/dark tokens */
+  select,
+  option,
+  optgroup {
+    background-color: var(--flow-panel-bg);
+    color: var(--flow-text);
+  }
+
+  .dark select,
+  .dark option,
+  .dark optgroup {
+    background-color: #191917;
+    color: #F2F1EC;
   }
 
   body.overlay-transparent,

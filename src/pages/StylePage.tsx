@@ -24,7 +24,7 @@ const CONTEXT_DETAILS: Record<
     headlinePrefix: 'Sound like ',
     headlineItalic: 'yourself',
     description:
-      'Automatically applied whenever Flow detects personal messaging apps — no manual tagging needed.',
+      'Automatically applied whenever CrispType detects personal messaging apps — no manual tagging needed.',
     detectedApps: ['WhatsApp', 'Telegram', 'Signal', 'iMessage', 'Discord', 'Messenger'],
     previews: {
       formal: {
@@ -137,7 +137,7 @@ export function StylePage() {
             Style
           </h1>
           <p className="mt-1 text-[13.5px] text-[var(--flow-text-muted)]">
-            Flow detects your active app automatically and applies the matching tone on your server
+            CrispType detects your active app automatically and applies the matching tone on your server
           </p>
         </div>
       </div>

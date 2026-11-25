@@ -73,6 +73,8 @@ export interface AppSettings {
   micDeviceId: string;
   silenceTimeoutSec: number;
   mockMode: boolean;
+  launchAtStartup: boolean;
+  minimizeToTray: boolean;
   theme: 'light' | 'dark';
 }
 

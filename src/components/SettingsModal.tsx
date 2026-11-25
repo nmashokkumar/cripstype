@@ -9,6 +9,7 @@ import {
   EyeOff,
   Keyboard,
   Loader2,
+  Mic,
   Moon,
   RotateCcw,
   Server,
@@ -18,12 +19,12 @@ import {
   X,
 } from 'lucide-react';
 import { useFlowStore } from '../store/useFlowStore';
+import { checkServerHealth, type ServerHealthResult } from '../services/api';
 import {
-  ASR_MODEL_OPTIONS,
-  checkServerHealth,
-  type ServerHealthResult,
-} from '../services/api';
-import { listAudioInputDevices, type MicDeviceOption } from '../services/audio';
+  listAudioInputDevices,
+  requestMicrophonePermission,
+  type MicDeviceOption,
+} from '../services/audio';
 import {
   DEFAULT_HANDS_FREE_HOTKEY,
   DEFAULT_PTT_HOTKEY,
@@ -34,7 +35,7 @@ import {
   normalizeEventCode,
 } from '../services/hotkeys';
 import { platform } from '../services/platform';
-import type { AsrModelOption, DictationMode, HotkeyBinding } from '../types';
+import type { DictationMode, HotkeyBinding } from '../types';
 
 type SettingsTab = 'server' | 'shortcuts' | 'audio';
 
@@ -63,6 +64,7 @@ export function SettingsModal() {
   const [testingConn, setTestingConn] = useState(false);
   const [connStatus, setConnStatus] = useState<ServerHealthResult | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [requestingMic, setRequestingMic] = useState(false);
 
   useEffect(() => {
     setIsCapturingHotkey(capturingTarget !== null);
@@ -80,7 +82,12 @@ export function SettingsModal() {
       return;
     }
     void listAudioInputDevices().then(setMics);
-  }, [settingsOpen]);
+    void platform.getAutoStart().then((osAutoStart) => {
+      if (typeof osAutoStart === 'boolean' && osAutoStart !== settings.launchAtStartup) {
+        updateSettings({ launchAtStartup: osAutoStart });
+      }
+    });
+  }, [settingsOpen, settings.launchAtStartup, updateSettings]);
 
   // Capture 1-key (e.g. Right Ctrl, fn), 2-key (e.g. Ctrl+Space, Ctrl+Alt), or 3-key combos
   useEffect(() => {
@@ -152,13 +159,22 @@ export function SettingsModal() {
     const result = await checkServerHealth({
       baseUrl: settings.serverUrl,
       apiKey: settings.apiKey,
-      mockMode: settings.mockMode,
+      mockMode: false,
     });
     setConnStatus(result);
     setTestingConn(false);
     if (result.ok) {
       pushToast('Server connected', 'success');
     }
+  };
+
+  const handleRequestMicPermission = async () => {
+    setRequestingMic(true);
+    const result = await requestMicrophonePermission();
+    const updatedMics = await listAudioInputDevices();
+    setMics(updatedMics);
+    setRequestingMic(false);
+    pushToast(result.message, result.granted ? 'success' : 'error');
   };
 
   const handleCopyInstall = async () => {
@@ -273,8 +289,7 @@ export function SettingsModal() {
                       setConnStatus(null);
                     }}
                     placeholder="https://your-server.instabox.tech"
-                    disabled={settings.mockMode}
-                    className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] px-3.5 text-[13.5px] text-[var(--flow-text)] placeholder:text-[var(--flow-text-muted)] focus:outline-none focus:border-[var(--flow-accent)] disabled:opacity-50"
+                    className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] dark:bg-[#191917] px-3.5 text-[13.5px] text-[var(--flow-text)] dark:text-[#F2F1EC] placeholder:text-[var(--flow-text-muted)] focus:outline-none focus:border-[var(--flow-accent)]"
                   />
                 </div>
 
@@ -296,8 +311,7 @@ export function SettingsModal() {
                         setConnStatus(null);
                       }}
                       placeholder="Leave blank if your server is open"
-                      disabled={settings.mockMode}
-                      className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] pl-3.5 pr-10 text-[13.5px] text-[var(--flow-text)] placeholder:text-[var(--flow-text-muted)] focus:outline-none focus:border-[var(--flow-accent)] disabled:opacity-50"
+                      className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] dark:bg-[#191917] pl-3.5 pr-10 text-[13.5px] text-[var(--flow-text)] dark:text-[#F2F1EC] placeholder:text-[var(--flow-text-muted)] focus:outline-none focus:border-[var(--flow-accent)]"
                     />
                     <button
                       type="button"
@@ -309,33 +323,9 @@ export function SettingsModal() {
                     </button>
                   </div>
                 </div>
-
-                <div>
-                  <label
-                    htmlFor="setting-asr-model"
-                    className="block text-[12px] font-medium text-[var(--flow-text-secondary)] mb-1.5"
-                  >
-                    Speech model
-                  </label>
-                  <select
-                    id="setting-asr-model"
-                    value={settings.asrModel}
-                    onChange={(e) =>
-                      updateSettings({ asrModel: e.target.value as AsrModelOption })
-                    }
-                    disabled={settings.mockMode}
-                    className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] px-3 text-[13px] text-[var(--flow-text)] focus:outline-none focus:border-[var(--flow-accent)] disabled:opacity-50"
-                  >
-                    {ASR_MODEL_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
               </div>
 
-              {/* Primary connect action + Offline demo toggle */}
+              {/* Primary connect action */}
               <div className="flex items-center justify-between gap-3 pt-0.5">
                 <button
                   type="button"
@@ -346,21 +336,6 @@ export function SettingsModal() {
                   {testingConn && <Loader2 size={14} className="animate-spin" />}
                   {testingConn ? 'Connecting…' : 'Connect'}
                 </button>
-
-                <label className="inline-flex items-center gap-2.5 text-[12.5px] text-[var(--flow-text-secondary)] cursor-pointer select-none">
-                  <span>Offline demo</span>
-                  <input
-                    type="checkbox"
-                    checked={settings.mockMode}
-                    onChange={(e) => {
-                      updateSettings({ mockMode: e.target.checked });
-                      setConnStatus(null);
-                    }}
-                    aria-label="Enable Offline demo mode"
-                    className="sr-only peer"
-                  />
-                  <span className="relative w-9 h-5 rounded-full bg-[var(--flow-border)] peer-checked:bg-[var(--flow-accent)] transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform peer-checked:after:translate-x-4" />
-                </label>
               </div>
 
               {/* Connection feedback */}
@@ -612,24 +587,46 @@ export function SettingsModal() {
           {activeTab === 'audio' && (
             <div className="space-y-4">
               <div>
-                <label
-                  htmlFor="setting-mic-device"
-                  className="block text-[12px] font-medium text-[var(--flow-text-secondary)] mb-1.5"
-                >
-                  Microphone
-                </label>
-                <select
-                  id="setting-mic-device"
-                  value={settings.micDeviceId}
-                  onChange={(e) => updateSettings({ micDeviceId: e.target.value })}
-                  className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] px-3 text-[13px] text-[var(--flow-text)] focus:outline-none focus:border-[var(--flow-accent)]"
-                >
-                  {mics.map((mic) => (
-                    <option key={mic.deviceId} value={mic.deviceId}>
-                      {mic.label}
-                    </option>
-                  ))}
-                </select>
+                <div className="flex items-center justify-between gap-2 mb-1.5">
+                  <label
+                    htmlFor="setting-mic-device"
+                    className="block text-[12px] font-medium text-[var(--flow-text-secondary)]"
+                  >
+                    Microphone
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void handleRequestMicPermission()}
+                    disabled={requestingMic}
+                    className="inline-flex items-center gap-1 text-[11.5px] font-medium text-[var(--flow-accent)] hover:underline cursor-pointer disabled:opacity-50"
+                  >
+                    <Mic size={12} />
+                    {requestingMic ? 'Checking mic…' : 'Allow mic access'}
+                  </button>
+                </div>
+                <div className="relative">
+                  <select
+                    id="setting-mic-device"
+                    value={settings.micDeviceId}
+                    onChange={(e) => updateSettings({ micDeviceId: e.target.value })}
+                    className="w-full h-10 appearance-none rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] dark:bg-[#191917] pl-3.5 pr-9 text-[13px] text-[var(--flow-text)] dark:text-[#F2F1EC] focus:outline-none focus:border-[var(--flow-accent)] cursor-pointer"
+                  >
+                    {mics.map((mic) => (
+                      <option
+                        key={mic.deviceId}
+                        value={mic.deviceId}
+                        className="bg-[var(--flow-panel-bg)] text-[var(--flow-text)] dark:bg-[#191917] dark:text-[#F2F1EC]"
+                      >
+                        {mic.label}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown
+                    size={15}
+                    aria-hidden="true"
+                    className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[var(--flow-text-muted)]"
+                  />
+                </div>
               </div>
 
               <div>
@@ -639,18 +636,103 @@ export function SettingsModal() {
                 >
                   Hands-free silence stop
                 </label>
-                <select
-                  id="setting-silence-timeout"
-                  value={settings.silenceTimeoutSec}
-                  onChange={(e) => updateSettings({ silenceTimeoutSec: Number(e.target.value) })}
-                  className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] px-3 text-[13px] text-[var(--flow-text)] focus:outline-none focus:border-[var(--flow-accent)]"
-                >
-                  <option value={0}>Manual stop only</option>
-                  <option value={2}>2 seconds</option>
-                  <option value={3}>3 seconds</option>
-                  <option value={5}>5 seconds (default)</option>
-                  <option value={8}>8 seconds</option>
-                </select>
+                <div className="relative">
+                  <select
+                    id="setting-silence-timeout"
+                    value={settings.silenceTimeoutSec}
+                    onChange={(e) => updateSettings({ silenceTimeoutSec: Number(e.target.value) })}
+                    className="w-full h-10 appearance-none rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] dark:bg-[#191917] pl-3.5 pr-9 text-[13px] text-[var(--flow-text)] dark:text-[#F2F1EC] focus:outline-none focus:border-[var(--flow-accent)] cursor-pointer"
+                  >
+                    <option
+                      value={0}
+                      className="bg-[var(--flow-panel-bg)] text-[var(--flow-text)] dark:bg-[#191917] dark:text-[#F2F1EC]"
+                    >
+                      Manual stop only
+                    </option>
+                    <option
+                      value={2}
+                      className="bg-[var(--flow-panel-bg)] text-[var(--flow-text)] dark:bg-[#191917] dark:text-[#F2F1EC]"
+                    >
+                      2 seconds
+                    </option>
+                    <option
+                      value={3}
+                      className="bg-[var(--flow-panel-bg)] text-[var(--flow-text)] dark:bg-[#191917] dark:text-[#F2F1EC]"
+                    >
+                      3 seconds
+                    </option>
+                    <option
+                      value={5}
+                      className="bg-[var(--flow-panel-bg)] text-[var(--flow-text)] dark:bg-[#191917] dark:text-[#F2F1EC]"
+                    >
+                      5 seconds (default)
+                    </option>
+                    <option
+                      value={8}
+                      className="bg-[var(--flow-panel-bg)] text-[var(--flow-text)] dark:bg-[#191917] dark:text-[#F2F1EC]"
+                    >
+                      8 seconds
+                    </option>
+                  </select>
+                  <ChevronDown
+                    size={15}
+                    aria-hidden="true"
+                    className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[var(--flow-text-muted)]"
+                  />
+                </div>
+              </div>
+
+              {/* Desktop Startup & System Tray */}
+              <div className="space-y-3 pt-2 border-t border-[var(--flow-border-subtle)]">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[13px] font-medium text-[var(--flow-text)]">
+                      Launch at startup
+                    </div>
+                    <div className="text-[12px] text-[var(--flow-text-muted)]">
+                      Auto-start CrispType in the background when you sign in
+                    </div>
+                  </div>
+                  <label className="inline-flex items-center cursor-pointer select-none shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={settings.launchAtStartup}
+                      onChange={(e) => {
+                        const enabled = e.target.checked;
+                        updateSettings({ launchAtStartup: enabled });
+                        pushToast(enabled ? 'Launch at startup enabled' : 'Launch at startup disabled');
+                      }}
+                      aria-label="Launch CrispType at startup"
+                      className="sr-only peer"
+                    />
+                    <span className="relative w-9 h-5 rounded-full bg-[var(--flow-border)] peer-checked:bg-[var(--flow-accent)] transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform peer-checked:after:translate-x-4" />
+                  </label>
+                </div>
+
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[13px] font-medium text-[var(--flow-text)]">
+                      Run in system tray
+                    </div>
+                    <div className="text-[12px] text-[var(--flow-text-muted)]">
+                      Keep global hotkeys &amp; floating popup active when window is closed
+                    </div>
+                  </div>
+                  <label className="inline-flex items-center cursor-pointer select-none shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={settings.minimizeToTray}
+                      onChange={(e) => {
+                        const enabled = e.target.checked;
+                        updateSettings({ minimizeToTray: enabled });
+                        pushToast(enabled ? 'System tray background mode on' : 'System tray background mode off');
+                      }}
+                      aria-label="Keep CrispType running in system tray"
+                      className="sr-only peer"
+                    />
+                    <span className="relative w-9 h-5 rounded-full bg-[var(--flow-border)] peer-checked:bg-[var(--flow-accent)] transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform peer-checked:after:translate-x-4" />
+                  </label>
+                </div>
               </div>
 
               <div className="flex items-center justify-between pt-2 border-t border-[var(--flow-border-subtle)]">

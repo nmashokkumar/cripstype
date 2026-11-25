@@ -95,31 +95,21 @@ export function DiagnosticsPage() {
   }, [snapshot.logs, filter]);
 
   const targetWsDisplay = useMemo(() => {
-    if (settings.mockMode) {
-      return typeof window !== 'undefined'
-        ? `${window.location.origin.replace(/^http/, 'ws')}/api/v1/meetings/transcribe`
-        : 'ws://localhost:3000/api/v1/meetings/transcribe';
-    }
     try {
       return deriveWebSocketUrl(settings.serverUrl);
     } catch {
       return settings.serverUrl || 'Not configured';
     }
-  }, [settings.mockMode, settings.serverUrl]);
+  }, [settings.serverUrl]);
 
   const handleRunStreamTest = async () => {
     setRunningTest(true);
     setTestResult(null);
 
-    const testBaseUrl =
-      settings.mockMode && typeof window !== 'undefined'
-        ? window.location.origin
-        : settings.serverUrl;
-
     const res = await runLiveStreamDiagnosticTest({
-      baseUrl: testBaseUrl,
-      apiKey: settings.mockMode ? undefined : settings.apiKey,
-      model: settings.asrModel,
+      baseUrl: settings.serverUrl,
+      apiKey: settings.apiKey,
+      model: 'auto',
       dictionary,
       styleMap: stylesByContext,
     });
@@ -236,7 +226,7 @@ export function DiagnosticsPage() {
             {targetWsDisplay}
           </div>
           <p className="mt-2 text-[11.5px] text-[var(--flow-text-secondary)]">
-            Model: {settings.asrModel === 'auto' ? 'Server default' : settings.asrModel}
+            Live 16 kHz PCM stream
           </p>
         </div>
       </section>

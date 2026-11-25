@@ -12,26 +12,45 @@ export interface NativeCommandHandlers {
  * OS-agnostic platform bridge.
  * Works seamlessly in:
  * - Standard web browsers (local test pad + clipboard)
+ * - Tauri v2 desktop apps (.deb / .AppImage / .exe / .dmg) via `window.__TAURI__` / `__TAURI_INTERNALS__`
  * - Electron (.exe / .deb / .dmg) via `window.flowNative` or `window.electronAPI`
- * - Tauri / Capacitor Android (.apk) via `window.flowNative`
+ * - Capacitor Android (.apk) via `window.flowNative`
  */
 export interface PlatformBridge {
   readonly isNativeHost: boolean;
+  readonly isTauriHost: boolean;
   detectActiveApp(): Promise<DetectedAppContext>;
   insertText(text: string): Promise<boolean>;
   copyToClipboard(text: string): Promise<boolean>;
   registerTestInputSink(sink: ((text: string) => void) | null): void;
   setOverlayInteractive(interactive: boolean): void;
+  setOverlayVisible(visible: boolean): void;
+  setAutoStart(enabled: boolean): Promise<boolean>;
+  getAutoStart(): Promise<boolean | null>;
+  setMinimizeToTray(enabled: boolean): Promise<void>;
   syncNativeHotkeys(bindings: { pushToTalk: HotkeyBinding; handsFree: HotkeyBinding }): void;
   subscribeNativeCommands(handlers: NativeCommandHandlers): () => void;
 }
 
+function getTauriInvoke():
+  | (<T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>)
+  | null {
+  if (typeof window === 'undefined') return null;
+  const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+  return typeof invoke === 'function' ? invoke : null;
+}
+
 class CrossPlatformBridge implements PlatformBridge {
   private testInputSink: ((text: string) => void) | null = null;
+  private lastOverlayVisible: boolean | null = null;
+
+  get isTauriHost(): boolean {
+    return getTauriInvoke() !== null;
+  }
 
   get isNativeHost(): boolean {
     if (typeof window === 'undefined') return false;
-    return Boolean(window.flowNative || window.electronAPI);
+    return Boolean(window.flowNative || window.electronAPI || this.isTauriHost);
   }
 
   registerTestInputSink(sink: ((text: string) => void) | null): void {
@@ -40,10 +59,27 @@ class CrossPlatformBridge implements PlatformBridge {
 
   /**
    * Automatically identifies the currently focused OS application via the native wrapper
-   * (Electron / Tauri / Android Accessibility bridge), falling back cleanly on web.
+   * (Tauri / Electron / Android Accessibility bridge), falling back cleanly on web.
    */
   async detectActiveApp(): Promise<DetectedAppContext> {
     if (typeof window !== 'undefined') {
+      const tauriInvoke = getTauriInvoke();
+      if (tauriInvoke) {
+        try {
+          const info = await tauriInvoke<{ appName?: string; windowTitle?: string } | string | null>(
+            'get_active_app'
+          );
+          if (typeof info === 'string' && info.trim()) {
+            return classifyAppContext(info);
+          }
+          if (info && typeof info === 'object' && (info.appName || info.windowTitle)) {
+            return classifyAppContext(info.appName, info.windowTitle);
+          }
+        } catch {
+          // Fall through cleanly if desktop window info is unavailable
+        }
+      }
+
       const getter = window.flowNative?.getActiveApp ?? window.electronAPI?.getActiveApp;
       if (typeof getter === 'function') {
         try {
@@ -61,7 +97,7 @@ class CrossPlatformBridge implements PlatformBridge {
 
       // Web fallback: infer context from document title if recognizable, else "Browser"
       const title = document.title?.trim() ?? '';
-      if (title && !/^flow\b/i.test(title)) {
+      if (title && !/^(flow|crisptype)\b/i.test(title)) {
         const classified = classifyAppContext('', title);
         if (classified.category !== 'other') {
           return classified;
@@ -76,8 +112,19 @@ class CrossPlatformBridge implements PlatformBridge {
   async insertText(text: string): Promise<boolean> {
     if (!text) return false;
 
-    // 1. Prefer native OS-level text injection when hosted inside a wrapper
     if (typeof window !== 'undefined') {
+      // 1. Prefer Tauri native paste when hosted inside CrispType desktop app
+      const tauriInvoke = getTauriInvoke();
+      if (tauriInvoke) {
+        try {
+          const pasted = await tauriInvoke<boolean>('paste_text', { text });
+          if (pasted) return true;
+        } catch {
+          // Fall through to clipboard / test sink
+        }
+      }
+
+      // 2. Electron / Capacitor bridge
       const nativePaste = window.flowNative?.pasteText ?? window.electronAPI?.pasteText;
       if (typeof nativePaste === 'function') {
         try {
@@ -89,7 +136,7 @@ class CrossPlatformBridge implements PlatformBridge {
       }
     }
 
-    // 2. Web / in-app test pad sink
+    // 3. Web / in-app test pad sink
     if (this.testInputSink) {
       this.testInputSink(text);
       return true;
@@ -141,6 +188,12 @@ class CrossPlatformBridge implements PlatformBridge {
    */
   setOverlayInteractive(interactive: boolean): void {
     if (typeof window === 'undefined') return;
+
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      void tauriInvoke('set_overlay_interactive', { interactive }).catch(() => undefined);
+    }
+
     const setter =
       window.flowNative?.setOverlayIgnoreMouseEvents ?? window.electronAPI?.setIgnoreMouseEvents;
     if (typeof setter !== 'function') return;
@@ -155,8 +208,113 @@ class CrossPlatformBridge implements PlatformBridge {
     }
   }
 
+  /**
+   * Shows or hides the always-on-top floating overlay window so it pops over
+   * any app even when the main CrispType window is closed to the system tray.
+   */
+  setOverlayVisible(visible: boolean): void {
+    if (typeof window === 'undefined') return;
+    if (this.lastOverlayVisible === visible) return;
+    this.lastOverlayVisible = visible;
+
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      void tauriInvoke('set_overlay_visible', { visible }).catch(() => undefined);
+    }
+
+    const setter = window.flowNative?.setOverlayVisible ?? window.electronAPI?.setOverlayVisible;
+    if (typeof setter === 'function') {
+      try {
+        void setter(visible);
+      } catch {
+        // Ignore bridge errors
+      }
+    }
+  }
+
+  async setAutoStart(enabled: boolean): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      try {
+        await tauriInvoke('set_autostart', { enabled });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const setter = window.flowNative?.setAutoStart ?? window.electronAPI?.setAutoStart;
+    if (typeof setter === 'function') {
+      try {
+        const res = await setter(enabled);
+        return res !== false;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  async getAutoStart(): Promise<boolean | null> {
+    if (typeof window === 'undefined') return null;
+
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      try {
+        const enabled = await tauriInvoke<boolean>('get_autostart');
+        return typeof enabled === 'boolean' ? enabled : null;
+      } catch {
+        return null;
+      }
+    }
+
+    const getter = window.flowNative?.getAutoStart ?? window.electronAPI?.getAutoStart;
+    if (typeof getter === 'function') {
+      try {
+        return Boolean(await getter());
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  async setMinimizeToTray(enabled: boolean): Promise<void> {
+    if (typeof window === 'undefined') return;
+
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      try {
+        await tauriInvoke('set_minimize_to_tray', { enabled });
+      } catch {
+        // Ignore if command unavailable
+      }
+      return;
+    }
+
+    const setter = window.flowNative?.setMinimizeToTray ?? window.electronAPI?.setMinimizeToTray;
+    if (typeof setter === 'function') {
+      try {
+        await setter(enabled);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
   syncNativeHotkeys(bindings: { pushToTalk: HotkeyBinding; handsFree: HotkeyBinding }): void {
     if (typeof window === 'undefined') return;
+
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      void tauriInvoke('update_hotkeys', {
+        pushToTalk: bindings.pushToTalk,
+        handsFree: bindings.handsFree,
+      }).catch(() => undefined);
+    }
+
     try {
       if (typeof window.flowNative?.updateHotkeys === 'function') {
         window.flowNative.updateHotkeys(bindings);
@@ -173,8 +331,6 @@ class CrossPlatformBridge implements PlatformBridge {
 
   subscribeNativeCommands(handlers: NativeCommandHandlers): () => void {
     if (typeof window === 'undefined') return () => {};
-    const bridge = window.flowNative ?? window.electronAPI;
-    if (!bridge) return () => {};
 
     const cleanups: Array<() => void> = [];
     const register = (maybeUnsub: (() => void) | void) => {
@@ -183,10 +339,69 @@ class CrossPlatformBridge implements PlatformBridge {
       }
     };
 
-    register(bridge.onDictationStart?.((mode) => handlers.onStart(mode)));
-    register(bridge.onDictationStop?.(() => handlers.onStop()));
-    register(bridge.onDictationToggle?.(() => handlers.onToggle()));
-    register(bridge.onOpenSettings?.(() => handlers.onOpenSettings()));
+    // 1. Electron / Capacitor bridge callbacks
+    const bridge = window.flowNative ?? window.electronAPI;
+    if (bridge) {
+      register(bridge.onDictationStart?.((mode) => handlers.onStart(mode)));
+      register(bridge.onDictationStop?.(() => handlers.onStop()));
+      register(bridge.onDictationToggle?.(() => handlers.onToggle()));
+      register(bridge.onOpenSettings?.(() => handlers.onOpenSettings()));
+    }
+
+    // 2. Tauri v2 event bridge (`withGlobalTauri: true`)
+    const tauriListen = window.__TAURI__?.event?.listen;
+    if (typeof tauriListen === 'function') {
+      let disposed = false;
+      const tauriUnsubs: Array<() => void> = [];
+      const attach = <T,>(eventName: string, fn: (payload: T) => void) => {
+        void tauriListen<T>(eventName, (ev) => fn(ev.payload))
+          .then((unlisten) => {
+            if (disposed) {
+              unlisten();
+            } else {
+              tauriUnsubs.push(unlisten);
+            }
+          })
+          .catch(() => undefined);
+      };
+
+      attach<DictationMode | undefined>('crisptype:dictation-start', (mode) => handlers.onStart(mode));
+      attach<void>('crisptype:dictation-stop', () => handlers.onStop());
+      attach<void>('crisptype:dictation-toggle', () => handlers.onToggle());
+      attach<void>('crisptype:open-settings', () => handlers.onOpenSettings());
+
+      cleanups.push(() => {
+        disposed = true;
+        for (const unlisten of tauriUnsubs) {
+          try {
+            unlisten();
+          } catch {
+            // Ignore
+          }
+        }
+      });
+    }
+
+    // 3. Fallback DOM CustomEvent listeners (dispatched by native wrappers when needed)
+    const onDomStart = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ mode?: DictationMode }>).detail;
+      handlers.onStart(detail?.mode);
+    };
+    const onDomStop = () => handlers.onStop();
+    const onDomToggle = () => handlers.onToggle();
+    const onDomSettings = () => handlers.onOpenSettings();
+
+    window.addEventListener('crisptype:dictation-start', onDomStart);
+    window.addEventListener('crisptype:dictation-stop', onDomStop);
+    window.addEventListener('crisptype:dictation-toggle', onDomToggle);
+    window.addEventListener('crisptype:open-settings', onDomSettings);
+
+    cleanups.push(() => {
+      window.removeEventListener('crisptype:dictation-start', onDomStart);
+      window.removeEventListener('crisptype:dictation-stop', onDomStop);
+      window.removeEventListener('crisptype:dictation-toggle', onDomToggle);
+      window.removeEventListener('crisptype:open-settings', onDomSettings);
+    });
 
     return () => {
       for (const unsub of cleanups) {
