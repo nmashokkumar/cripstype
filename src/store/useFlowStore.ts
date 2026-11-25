@@ -313,6 +313,12 @@ export const useFlowStore = create<FlowState>((set, get) => {
       set((state) => {
         const next = { ...state.settings, ...partial };
         writeJson(SETTINGS_KEY, next);
+        if (
+          (partial.micDeviceId !== undefined && partial.micDeviceId !== state.settings.micDeviceId) ||
+          partial.mockMode === true
+        ) {
+          audioController.releaseWarmPipeline();
+        }
         if (partial.pushToTalkHotkey || partial.handsFreeHotkey) {
           platform.syncNativeHotkeys({
             pushToTalk: next.pushToTalkHotkey,

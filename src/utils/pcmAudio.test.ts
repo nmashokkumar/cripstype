@@ -4,6 +4,7 @@ import {
   PCM_PACKET_BYTES,
   PCM_PACKET_SAMPLES,
   PcmPacketizer,
+  PcmPreRollBuffer,
   deriveWebSocketUrl,
   downsampleFloat32To16kInt16,
   encodePcm16ToWavBlob,
@@ -51,6 +52,22 @@ describe('pcmAudio — resampling & 1,024-byte packetization', () => {
     assert.ok(tail !== null);
     assert.equal(tail!.byteLength, PCM_PACKET_BYTES);
     assert.equal(packetizer.flush(), null);
+  });
+
+  it('preserves the most recent pre-roll samples in chronological order across wrap-around', () => {
+    const preRoll = new PcmPreRollBuffer(6);
+    preRoll.push(new Int16Array([1, 2, 3, 4]));
+    assert.equal(preRoll.length, 4);
+
+    // Push 4 more -> wraps around, keeping [3, 4, 5, 6, 7, 8]
+    preRoll.push(new Int16Array([5, 6, 7, 8]));
+    assert.equal(preRoll.length, 6);
+    assert.deepEqual(Array.from(preRoll.drain()), [3, 4, 5, 6, 7, 8]);
+    assert.equal(preRoll.length, 0);
+
+    // Oversized push retains only trailing capacity samples
+    preRoll.push(new Int16Array([10, 11, 12, 13, 14, 15, 16, 17]));
+    assert.deepEqual(Array.from(preRoll.drain()), [12, 13, 14, 15, 16, 17]);
   });
 
   it('encodes valid RIFF WAVE blob from Int16 PCM chunks', async () => {

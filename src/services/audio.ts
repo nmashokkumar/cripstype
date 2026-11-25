@@ -1,10 +1,13 @@
 import {
   PCM_PACKET_SAMPLES,
+  PRE_ROLL_SAMPLES,
   PcmPacketizer,
+  PcmPreRollBuffer,
   TARGET_SAMPLE_RATE,
   downsampleFloat32To16kInt16,
   encodePcm16ToWavBlob,
 } from '../utils/pcmAudio';
+import { AdaptiveVoiceActivityDetector } from '../utils/voiceActivity';
 
 export interface AudioRecorderCallbacks {
   onLevels: (bars: number[]) => void;
@@ -27,7 +30,9 @@ export interface MicDeviceOption {
 }
 
 const BAR_COUNT = 10;
+const ANALYSER_FFT_SIZE = 256; // 62.5 Hz resolution @ 16 kHz -> clean 300–3400 Hz speech isolation
 export const MAX_MONOLOGUE_DURATION_MS = 5 * 60 * 1000; // 5 minutes safety limit
+export const WARM_IDLE_TTL_MS = 2 * 60 * 1000; // Keep mic warm for 2 minutes after dictation
 
 const WORKLET_PROCESSOR_CODE = `
 class PcmStreamProcessor extends AudioWorkletProcessor {
@@ -108,27 +113,37 @@ export function playCompletionChime(): void {
 }
 
 /**
- * Dual-mode audio capture controller:
- * - Captures 16kHz mono mic input with echoCancellation, noiseSuppression, autoGainControl
- * - Streams live 16-bit signed LE PCM in exact 1,024-byte (512-sample = 32ms) ArrayBuffer packets
- * - Simultaneously caches audio chunks as a playable Blob (audio/webm with WAV fallback) for IndexedDB
- * - Drives 10-bar RMS visualizer, elapsed timer, 5s silence auto-stop, and 5-minute monologue safety
+ * Dual-mode audio capture controller with:
+ * - Warm microphone standby (2-min idle TTL) + 220 ms circular pre-roll buffer for instant start
+ * - Adaptive speech-band (300–3,400 Hz) noise-floor VAD so fans, AC, and light breathing don't
+ *   animate waveform bars or block Hands-Free auto-stop
+ * - Live 16 kHz Int16 mono streaming in exact 1,024-byte (512-sample = 32 ms) WebSocket packets
+ * - Parallel local audio Blob recording (audio/webm with WAV fallback) for IndexedDB playback
  */
 export class AudioCaptureController {
+  // Persistent warm pipeline resources (kept alive up to WARM_IDLE_TTL_MS between dictations)
   private stream: MediaStream | null = null;
-  private recorder: MediaRecorder | null = null;
   private audioCtx: AudioContext | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
   private analyser: AnalyserNode | null = null;
   private workletNode: AudioWorkletNode | null = null;
   private scriptNode: ScriptProcessorNode | null = null;
   private silentGain: GainNode | null = null;
   private workletUrl: string | null = null;
+  private warmDeviceId: string | null = null;
+  private warmIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private unloadHandlerBound = false;
 
+  // Per-session recording state
+  private recorder: MediaRecorder | null = null;
   private chunks: Blob[] = [];
   private pcmArchive: Int16Array[] = [];
   private packetizer = new PcmPacketizer(PCM_PACKET_SAMPLES);
+  private preRollBuffer = new PcmPreRollBuffer(PRE_ROLL_SAMPLES);
+  private vad = new AdaptiveVoiceActivityDetector({ barCount: BAR_COUNT });
   private callbacks: AudioRecorderCallbacks | null = null;
 
+  private isRecording = false;
   private rafId: number | null = null;
   private startedAt = 0;
   private lastVoiceAt = 0;
@@ -138,27 +153,69 @@ export class AudioCaptureController {
   private isSimulated = false;
   private stopResolver: ((res: AudioRecordingResult) => void) | null = null;
 
-  async start(options: {
-    deviceId?: string;
-    silenceTimeoutMs?: number;
-    maxDurationMs?: number;
-    allowSimulatedFallback?: boolean;
-    callbacks: AudioRecorderCallbacks;
-  }): Promise<void> {
-    this.cleanup();
-    this.chunks = [];
-    this.pcmArchive = [];
-    this.packetizer.reset();
-    this.callbacks = options.callbacks;
-    this.startedAt = performance.now();
-    this.lastVoiceAt = performance.now();
-    this.lastTimerEmitSec = 0;
-    this.silenceTriggered = false;
-    this.maxDurationTriggered = false;
-    this.isSimulated = false;
+  private readonly handlePageUnload = () => {
+    this.releaseWarmPipeline();
+  };
 
-    const maxDurationMs = options.maxDurationMs ?? MAX_MONOLOGUE_DURATION_MS;
-    options.callbacks.onElapsedMs?.(0);
+  private isWarmPipelineReady(requestedDeviceId: string): boolean {
+    if (!this.stream || !this.audioCtx || this.audioCtx.state === 'closed') return false;
+    if (!this.analyser || (!this.workletNode && !this.scriptNode)) return false;
+    if (this.warmDeviceId !== requestedDeviceId) return false;
+    return this.stream.getAudioTracks().some((t) => t.readyState === 'live' && t.enabled);
+  }
+
+  private clearWarmIdleTimer(): void {
+    if (this.warmIdleTimer !== null) {
+      clearTimeout(this.warmIdleTimer);
+      this.warmIdleTimer = null;
+    }
+  }
+
+  private enterWarmStandby(): void {
+    this.clearWarmIdleTimer();
+    if (!this.stream || !this.audioCtx || this.audioCtx.state === 'closed') return;
+
+    this.preRollBuffer.clear();
+    this.warmIdleTimer = setTimeout(() => {
+      if (!this.isRecording) {
+        this.releaseWarmPipeline();
+      }
+    }, WARM_IDLE_TTL_MS);
+  }
+
+  private handleIncomingFloatChunk(floatSamples: Float32Array): void {
+    const inputRate = this.audioCtx?.sampleRate ?? TARGET_SAMPLE_RATE;
+    const pcm16 = downsampleFloat32To16kInt16(floatSamples, inputRate, TARGET_SAMPLE_RATE);
+    if (pcm16.length === 0) return;
+
+    if (this.isRecording) {
+      this.pcmArchive.push(pcm16);
+      const packets = this.packetizer.push(pcm16);
+      for (const packet of packets) {
+        this.callbacks?.onPcmPacket?.(packet);
+      }
+    } else {
+      // Warm standby: keep only the trailing 220 ms so the opening syllable is never clipped
+      this.preRollBuffer.push(pcm16);
+    }
+  }
+
+  private async ensureAudioPipeline(requestedDeviceId: string): Promise<{ wasWarm: boolean }> {
+    this.clearWarmIdleTimer();
+
+    if (this.isWarmPipelineReady(requestedDeviceId)) {
+      if (this.audioCtx && this.audioCtx.state === 'suspended') {
+        await this.audioCtx.resume();
+      }
+      return { wasWarm: true };
+    }
+
+    // Cold open (or mic device changed): release any previous warm resources cleanly
+    this.releaseWarmPipeline();
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Microphone capture is not supported in this browser context.');
+    }
 
     const baseAudioConstraints: MediaTrackConstraints = {
       echoCancellation: true,
@@ -170,17 +227,130 @@ export class AudioCaptureController {
 
     const constraints: MediaStreamConstraints = {
       audio:
-        options.deviceId && options.deviceId !== 'default'
-          ? { ...baseAudioConstraints, deviceId: { exact: options.deviceId } }
+        requestedDeviceId !== 'default'
+          ? { ...baseAudioConstraints, deviceId: { exact: requestedDeviceId } }
           : baseAudioConstraints,
     };
 
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    this.stream = stream;
+    this.warmDeviceId = requestedDeviceId;
+
+    // If OS revokes or unplugs the mic while in warm standby, clean up automatically
+    for (const track of stream.getAudioTracks()) {
+      track.addEventListener(
+        'ended',
+        () => {
+          if (!this.isRecording && this.stream === stream) {
+            this.releaseWarmPipeline();
+          }
+        },
+        { once: true }
+      );
+    }
+
+    const AudioContextCtor =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('Microphone capture is not supported in this browser context.');
+      this.audioCtx = new AudioContextCtor({ sampleRate: TARGET_SAMPLE_RATE });
+    } catch {
+      this.audioCtx = new AudioContextCtor();
+    }
+
+    if (this.audioCtx.state === 'suspended') {
+      await this.audioCtx.resume();
+    }
+
+    this.sourceNode = this.audioCtx.createMediaStreamSource(this.stream);
+    this.analyser = this.audioCtx.createAnalyser();
+    this.analyser.fftSize = ANALYSER_FFT_SIZE;
+    this.analyser.smoothingTimeConstant = 0.72;
+    this.sourceNode.connect(this.analyser);
+
+    this.silentGain = this.audioCtx.createGain();
+    this.silentGain.gain.value = 0;
+    this.silentGain.connect(this.audioCtx.destination);
+
+    let workletReady = false;
+    if (this.audioCtx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+      try {
+        const workletBlob = new Blob([WORKLET_PROCESSOR_CODE], {
+          type: 'application/javascript',
+        });
+        this.workletUrl = URL.createObjectURL(workletBlob);
+        await this.audioCtx.audioWorklet.addModule(this.workletUrl);
+        this.workletNode = new AudioWorkletNode(this.audioCtx, 'flow-pcm-stream-processor');
+        this.workletNode.port.onmessage = (event) => {
+          if (event.data instanceof Float32Array) {
+            this.handleIncomingFloatChunk(event.data);
+          }
+        };
+        this.sourceNode.connect(this.workletNode);
+        this.workletNode.connect(this.silentGain);
+        workletReady = true;
+      } catch {
+        workletReady = false;
+      }
+    }
+
+    if (!workletReady) {
+      this.scriptNode = this.audioCtx.createScriptProcessor(1024, 1, 1);
+      this.scriptNode.onaudioprocess = (ev) => {
+        const channel = ev.inputBuffer.getChannelData(0);
+        this.handleIncomingFloatChunk(new Float32Array(channel));
+      };
+      this.sourceNode.connect(this.scriptNode);
+      this.scriptNode.connect(this.silentGain);
+    }
+
+    if (typeof window !== 'undefined' && !this.unloadHandlerBound) {
+      window.addEventListener('pagehide', this.handlePageUnload);
+      this.unloadHandlerBound = true;
+    }
+
+    return { wasWarm: false };
+  }
+
+  async start(options: {
+    deviceId?: string;
+    silenceTimeoutMs?: number;
+    maxDurationMs?: number;
+    allowSimulatedFallback?: boolean;
+    callbacks: AudioRecorderCallbacks;
+  }): Promise<void> {
+    this.resetSessionState();
+    this.callbacks = options.callbacks;
+    this.startedAt = performance.now();
+    this.lastVoiceAt = performance.now();
+    this.lastTimerEmitSec = 0;
+    this.silenceTriggered = false;
+    this.maxDurationTriggered = false;
+    this.isSimulated = false;
+
+    const requestedDeviceId = options.deviceId?.trim() || 'default';
+    const maxDurationMs = options.maxDurationMs ?? MAX_MONOLOGUE_DURATION_MS;
+    options.callbacks.onElapsedMs?.(0);
+
+    try {
+      const { wasWarm } = await this.ensureAudioPipeline(requestedDeviceId);
+      this.vad.reset({ keepNoiseFloor: wasWarm });
+
+      // Flush the 220 ms warm pre-roll right at the start of the stream so opening syllables are kept
+      if (wasWarm) {
+        const preRoll = this.preRollBuffer.drain();
+        if (preRoll.length > 0) {
+          this.pcmArchive.push(preRoll);
+          const prePackets = this.packetizer.push(preRoll);
+          for (const packet of prePackets) {
+            this.callbacks?.onPcmPacket?.(packet);
+          }
+        }
+      } else {
+        this.preRollBuffer.clear();
       }
 
-      this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+      this.isRecording = true;
 
       // Record compressed audio Blob in parallel for IndexedDB playback & batch re-transcribe
       const mimeType =
@@ -190,7 +360,7 @@ export class AudioCaptureController {
             ? 'audio/webm'
             : '';
 
-      if (typeof MediaRecorder !== 'undefined') {
+      if (typeof MediaRecorder !== 'undefined' && this.stream) {
         this.recorder = mimeType
           ? new MediaRecorder(this.stream, { mimeType })
           : new MediaRecorder(this.stream);
@@ -209,82 +379,19 @@ export class AudioCaptureController {
               : encodePcm16ToWavBlob(this.pcmArchive, TARGET_SAMPLE_RATE);
           const resolve = this.stopResolver;
           this.stopResolver = null;
-          this.cleanup();
+          this.recorder = null;
+          this.chunks = [];
+          this.pcmArchive = [];
+          this.enterWarmStandby();
           resolve?.({ blob, durationMs, simulated: false });
         };
+
+        this.recorder.start(120);
       }
 
-      // Build Web Audio graph (prefer 16kHz context, gracefully resample any native hardware rate)
-      const AudioContextCtor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      try {
-        this.audioCtx = new AudioContextCtor({ sampleRate: TARGET_SAMPLE_RATE });
-      } catch {
-        this.audioCtx = new AudioContextCtor();
-      }
-
-      if (this.audioCtx.state === 'suspended') {
-        await this.audioCtx.resume();
-      }
-
-      const source = this.audioCtx.createMediaStreamSource(this.stream);
-      this.analyser = this.audioCtx.createAnalyser();
-      this.analyser.fftSize = 64;
-      this.analyser.smoothingTimeConstant = 0.78;
-      source.connect(this.analyser);
-
-      // Connect live PCM streamer (AudioWorkletNode with ScriptProcessorNode fallback)
-      const inputRate = this.audioCtx.sampleRate;
-      const handleFloatChunk = (floatSamples: Float32Array) => {
-        const pcm16 = downsampleFloat32To16kInt16(floatSamples, inputRate, TARGET_SAMPLE_RATE);
-        if (pcm16.length === 0) return;
-        this.pcmArchive.push(pcm16);
-        const packets = this.packetizer.push(pcm16);
-        for (const packet of packets) {
-          this.callbacks?.onPcmPacket?.(packet);
-        }
-      };
-
-      this.silentGain = this.audioCtx.createGain();
-      this.silentGain.gain.value = 0;
-      this.silentGain.connect(this.audioCtx.destination);
-
-      let workletReady = false;
-      if (this.audioCtx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
-        try {
-          const workletBlob = new Blob([WORKLET_PROCESSOR_CODE], {
-            type: 'application/javascript',
-          });
-          this.workletUrl = URL.createObjectURL(workletBlob);
-          await this.audioCtx.audioWorklet.addModule(this.workletUrl);
-          this.workletNode = new AudioWorkletNode(this.audioCtx, 'flow-pcm-stream-processor');
-          this.workletNode.port.onmessage = (event) => {
-            if (event.data instanceof Float32Array) {
-              handleFloatChunk(event.data);
-            }
-          };
-          source.connect(this.workletNode);
-          this.workletNode.connect(this.silentGain);
-          workletReady = true;
-        } catch {
-          workletReady = false;
-        }
-      }
-
-      if (!workletReady) {
-        this.scriptNode = this.audioCtx.createScriptProcessor(1024, 1, 1);
-        this.scriptNode.onaudioprocess = (ev) => {
-          const channel = ev.inputBuffer.getChannelData(0);
-          handleFloatChunk(new Float32Array(channel));
-        };
-        source.connect(this.scriptNode);
-        this.scriptNode.connect(this.silentGain);
-      }
-
-      this.recorder?.start(120);
       this.startMeterLoop(options.silenceTimeoutMs, maxDurationMs, options.callbacks);
     } catch (err) {
+      this.isRecording = false;
       const name = err instanceof DOMException ? err.name : '';
       if (options.allowSimulatedFallback) {
         this.isSimulated = true;
@@ -292,6 +399,7 @@ export class AudioCaptureController {
         return;
       }
 
+      this.releaseWarmPipeline();
       if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
         throw new Error('Microphone permission denied. Allow mic access in your browser or OS settings.');
       }
@@ -307,31 +415,18 @@ export class AudioCaptureController {
     maxDurationMs: number,
     callbacks: AudioRecorderCallbacks
   ) {
-    const freqData = new Uint8Array(this.analyser ? this.analyser.frequencyBinCount : 16);
-    const timeData = new Uint8Array(this.analyser ? this.analyser.fftSize : 64);
+    const analyser = this.analyser;
+    const freqData = new Uint8Array(analyser ? analyser.frequencyBinCount : 128);
+    const timeData = new Uint8Array(analyser ? analyser.fftSize : ANALYSER_FFT_SIZE);
 
     const tick = () => {
-      if (!this.analyser) return;
+      if (!this.isRecording || !this.analyser) return;
       this.analyser.getByteFrequencyData(freqData);
       this.analyser.getByteTimeDomainData(timeData);
 
-      // Compute RMS volume for reliable voice-activity / silence detection
-      let sumSquares = 0;
-      for (let i = 0; i < timeData.length; i += 1) {
-        const centered = (timeData[i] - 128) / 128;
-        sumSquares += centered * centered;
-      }
-      const rms = Math.sqrt(sumSquares / timeData.length);
-
-      const bars: number[] = [];
-      for (let i = 0; i < BAR_COUNT; i += 1) {
-        const binIndex = Math.min(freqData.length - 1, Math.floor((i * freqData.length) / BAR_COUNT) + 1);
-        const freqLevel = Math.min(1, freqData[binIndex] / 190);
-        const boosted = Math.max(freqLevel, Math.min(1, rms * 3.4));
-        bars.push(Math.max(0.14, boosted));
-      }
-
-      callbacks.onLevels(bars);
+      const sampleRate = this.audioCtx?.sampleRate ?? TARGET_SAMPLE_RATE;
+      const frame = this.vad.analyze(freqData, timeData, sampleRate, this.analyser.fftSize);
+      callbacks.onLevels(frame.bars);
 
       const now = performance.now();
       const elapsedMs = now - this.startedAt;
@@ -348,8 +443,8 @@ export class AudioCaptureController {
         return;
       }
 
-      // Continuous silence detection (5s default in Hands-Free mode)
-      if (rms > 0.009) {
+      // Adaptive noise-floor silence detection (Hands-Free mode)
+      if (frame.isSpeech) {
         this.lastVoiceAt = now;
       } else if (
         silenceTimeoutMs &&
@@ -416,35 +511,24 @@ export class AudioCaptureController {
   }
 
   async stop(): Promise<AudioRecordingResult> {
-    // Stop live audio worklet/script handlers first so no trailing chunk arrives after flush
-    if (this.workletNode) {
-      try {
-        this.workletNode.port.onmessage = null;
-        this.workletNode.disconnect();
-      } catch {
-        // Ignore
-      }
-      this.workletNode = null;
-    }
-    if (this.scriptNode) {
-      try {
-        this.scriptNode.onaudioprocess = null;
-        this.scriptNode.disconnect();
-      } catch {
-        // Ignore
-      }
-      this.scriptNode = null;
+    // Flip recording gate off first so no new live chunks enter packetizer after flush
+    this.isRecording = false;
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
     }
 
-    // Flush any remaining buffered 16kHz PCM samples before closing MediaRecorder
+    // Flush any remaining buffered 16 kHz PCM samples before stopping MediaRecorder
     const tailPacket = this.packetizer.flush();
     if (tailPacket) {
       this.callbacks?.onPcmPacket?.(tailPacket);
     }
+    this.callbacks = null;
 
     if (this.isSimulated) {
       const durationMs = Math.max(900, Math.round(performance.now() - this.startedAt));
-      this.cleanup();
+      this.isSimulated = false;
+      this.resetSessionState();
       return {
         blob: new Blob(['simulated-audio-webm'], { type: 'audio/webm;codecs=opus' }),
         durationMs,
@@ -458,7 +542,10 @@ export class AudioCaptureController {
         this.chunks.length > 0
           ? new Blob(this.chunks, { type: 'audio/webm;codecs=opus' })
           : encodePcm16ToWavBlob(this.pcmArchive, TARGET_SAMPLE_RATE);
-      this.cleanup();
+      this.recorder = null;
+      this.chunks = [];
+      this.pcmArchive = [];
+      this.enterWarmStandby();
       return {
         blob,
         durationMs,
@@ -476,7 +563,11 @@ export class AudioCaptureController {
           this.chunks.length > 0
             ? new Blob(this.chunks, { type: 'audio/webm;codecs=opus' })
             : encodePcm16ToWavBlob(this.pcmArchive, TARGET_SAMPLE_RATE);
-        this.cleanup();
+        this.stopResolver = null;
+        this.recorder = null;
+        this.chunks = [];
+        this.pcmArchive = [];
+        this.enterWarmStandby();
         resolve({
           blob,
           durationMs,
@@ -487,6 +578,7 @@ export class AudioCaptureController {
   }
 
   cancel(): void {
+    this.isRecording = false;
     this.stopResolver = null;
     if (this.recorder && this.recorder.state !== 'inactive') {
       try {
@@ -496,16 +588,23 @@ export class AudioCaptureController {
         // Ignore recorder stop errors on cancel
       }
     }
-    this.cleanup();
+    this.resetSessionState();
+    if (this.stream) {
+      this.enterWarmStandby();
+    }
   }
 
-  private cleanup(): void {
-    this.isSimulated = false;
-    this.callbacks = null;
-    if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = null;
-    }
+  /**
+   * Immediately releases the warm microphone stream & AudioContext (e.g., on mic change,
+   * idle timeout, offline demo switch, or window unload).
+   */
+  releaseWarmPipeline(): void {
+    this.clearWarmIdleTimer();
+    this.isRecording = false;
+    this.resetSessionState();
+    this.preRollBuffer.clear();
+    this.warmDeviceId = null;
+
     if (this.workletNode) {
       try {
         this.workletNode.port.onmessage = null;
@@ -523,6 +622,14 @@ export class AudioCaptureController {
         // Ignore
       }
       this.scriptNode = null;
+    }
+    if (this.sourceNode) {
+      try {
+        this.sourceNode.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.sourceNode = null;
     }
     if (this.silentGain) {
       try {
@@ -545,6 +652,23 @@ export class AudioCaptureController {
       this.audioCtx = null;
     }
     this.analyser = null;
+
+    if (typeof window !== 'undefined' && this.unloadHandlerBound) {
+      window.removeEventListener('pagehide', this.handlePageUnload);
+      this.unloadHandlerBound = false;
+    }
+  }
+
+  private resetSessionState(): void {
+    this.isSimulated = false;
+    this.callbacks = null;
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
     this.recorder = null;
+    this.chunks = [];
+    this.pcmArchive = [];
+    this.packetizer.reset();
   }
 }

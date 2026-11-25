@@ -6,6 +6,90 @@
 export const TARGET_SAMPLE_RATE = 16000;
 export const PCM_PACKET_SAMPLES = 512; // 32ms at 16kHz mono
 export const PCM_PACKET_BYTES = PCM_PACKET_SAMPLES * 2; // 1,024 bytes (16-bit signed LE)
+export const PRE_ROLL_MS = 220; // ~0.22s rolling pre-roll so the first syllable is never clipped
+export const PRE_ROLL_SAMPLES = Math.round((TARGET_SAMPLE_RATE * PRE_ROLL_MS) / 1000);
+
+/**
+ * Fixed-capacity circular ring buffer holding the most recent 16 kHz Int16 PCM samples
+ * while the microphone is in warm standby. Drained immediately on dictation start so
+ * opening syllables spoken right as the hotkey is pressed are preserved.
+ */
+export class PcmPreRollBuffer {
+  private readonly buffer: Int16Array;
+  private writeIndex = 0;
+  private filled = 0;
+
+  constructor(capacitySamples: number = PRE_ROLL_SAMPLES) {
+    this.buffer = new Int16Array(Math.max(1, capacitySamples));
+  }
+
+  get capacity(): number {
+    return this.buffer.length;
+  }
+
+  get length(): number {
+    return this.filled;
+  }
+
+  push(samples: Int16Array): void {
+    const cap = this.buffer.length;
+    if (samples.length === 0) return;
+
+    if (samples.length >= cap) {
+      // Only the trailing `cap` samples fit
+      this.buffer.set(samples.subarray(samples.length - cap), 0);
+      this.writeIndex = 0;
+      this.filled = cap;
+      return;
+    }
+
+    const firstPart = Math.min(samples.length, cap - this.writeIndex);
+    this.buffer.set(samples.subarray(0, firstPart), this.writeIndex);
+
+    const remaining = samples.length - firstPart;
+    if (remaining > 0) {
+      this.buffer.set(samples.subarray(firstPart), 0);
+    }
+
+    this.writeIndex = (this.writeIndex + samples.length) % cap;
+    this.filled = Math.min(cap, this.filled + samples.length);
+  }
+
+  /**
+   * Returns all currently buffered samples in chronological order and clears the buffer.
+   */
+  drain(): Int16Array {
+    if (this.filled === 0) return new Int16Array(0);
+
+    const cap = this.buffer.length;
+    const out = new Int16Array(this.filled);
+
+    if (this.filled < cap) {
+      const start = (this.writeIndex - this.filled + cap) % cap;
+      const firstPart = Math.min(this.filled, cap - start);
+      out.set(this.buffer.subarray(start, start + firstPart), 0);
+      if (firstPart < this.filled) {
+        out.set(this.buffer.subarray(0, this.filled - firstPart), firstPart);
+      }
+    } else {
+      // Buffer is full: oldest sample starts at writeIndex
+      const firstPart = cap - this.writeIndex;
+      out.set(this.buffer.subarray(this.writeIndex, cap), 0);
+      if (this.writeIndex > 0) {
+        out.set(this.buffer.subarray(0, this.writeIndex), firstPart);
+      }
+    }
+
+    this.clear();
+    return out;
+  }
+
+  clear(): void {
+    this.writeIndex = 0;
+    this.filled = 0;
+    this.buffer.fill(0);
+  }
+}
 
 /**
  * Downsamples mono Float32 PCM audio from an arbitrary device sample rate

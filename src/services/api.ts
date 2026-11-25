@@ -413,6 +413,14 @@ export class StreamingDictationSession {
     };
   }
 
+  get packetsSent(): number {
+    return this.sentPacketCount;
+  }
+
+  get bytesSent(): number {
+    return this.sentByteCount;
+  }
+
   connect(): void {
     diagnostics.startSession(this.displayUrl);
     diagnostics.record({
