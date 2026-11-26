@@ -1,18 +1,31 @@
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { Moon, PanelLeft, Sun } from 'lucide-react';
 import { useFlowStore } from './store/useFlowStore';
 import { hotkeyProvider } from './services/hotkeys';
 import { platform } from './services/platform';
 import { Sidebar } from './components/Sidebar';
 import { OverlayPill } from './components/OverlayPill';
-import { SettingsModal } from './components/SettingsModal';
 import { ToastStack } from './components/Toast';
 import { DictationPage } from './pages/DictationPage';
-import { InsightsPage } from './pages/InsightsPage';
-import { DictionaryPage } from './pages/DictionaryPage';
-import { StylePage } from './pages/StylePage';
-import { DiagnosticsPage } from './pages/DiagnosticsPage';
-import { OverlayRoute } from './pages/OverlayRoute';
+
+const SettingsModal = lazy(() =>
+  import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal }))
+);
+const InsightsPage = lazy(() =>
+  import('./pages/InsightsPage').then((m) => ({ default: m.InsightsPage }))
+);
+const DictionaryPage = lazy(() =>
+  import('./pages/DictionaryPage').then((m) => ({ default: m.DictionaryPage }))
+);
+const StylePage = lazy(() =>
+  import('./pages/StylePage').then((m) => ({ default: m.StylePage }))
+);
+const DiagnosticsPage = lazy(() =>
+  import('./pages/DiagnosticsPage').then((m) => ({ default: m.DiagnosticsPage }))
+);
+const OverlayRoute = lazy(() =>
+  import('./pages/OverlayRoute').then((m) => ({ default: m.OverlayRoute }))
+);
 
 function isOverlayPathname(): boolean {
   if (typeof window === 'undefined') return false;
@@ -26,6 +39,7 @@ export default function App() {
   const toggleSidebar = useFlowStore((s) => s.toggleSidebar);
   const toggleTheme = useFlowStore((s) => s.toggleTheme);
   const setSettingsOpen = useFlowStore((s) => s.setSettingsOpen);
+  const initPersistedSettings = useFlowStore((s) => s.initPersistedSettings);
   const initHistory = useFlowStore((s) => s.initHistory);
   const initDictionary = useFlowStore((s) => s.initDictionary);
   const startDictation = useFlowStore((s) => s.startDictation);
@@ -42,8 +56,9 @@ export default function App() {
     }
   }, [settings.theme]);
 
-  // Load IndexedDB history and custom dictionary on startup + sync native tray/autostart/hotkeys
+  // Load persisted native config, IndexedDB history and custom dictionary on startup
   useEffect(() => {
+    void initPersistedSettings();
     void initHistory();
     void initDictionary();
     if (!isOverlayPathname()) {
@@ -88,6 +103,11 @@ export default function App() {
       onOpenSettings: () => setSettingsOpen(true),
     });
 
+    const tauriInvoke = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+    if (typeof tauriInvoke === 'function') {
+      void tauriInvoke('frontend_ready').catch(() => undefined);
+    }
+
     return () => {
       unsubBrowserHotkeys();
       unsubNative();
@@ -103,7 +123,11 @@ export default function App() {
   ]);
 
   if (overlayOnly) {
-    return <OverlayRoute />;
+    return (
+      <Suspense fallback={null}>
+        <OverlayRoute />
+      </Suspense>
+    );
   }
 
   return (
@@ -143,11 +167,13 @@ export default function App() {
           className="flex-1 min-w-0 mr-3 mb-3 rounded-[24px] bg-[var(--flow-panel-bg)] overflow-y-auto"
           style={{ boxShadow: 'var(--flow-panel-shadow)' }}
         >
-          {activePage === 'dictation' && <DictationPage />}
-          {activePage === 'insights' && <InsightsPage />}
-          {activePage === 'dictionary' && <DictionaryPage />}
-          {activePage === 'style' && <StylePage />}
-          {activePage === 'diagnostics' && <DiagnosticsPage />}
+          <Suspense fallback={null}>
+            {activePage === 'dictation' && <DictationPage />}
+            {activePage === 'insights' && <InsightsPage />}
+            {activePage === 'dictionary' && <DictionaryPage />}
+            {activePage === 'style' && <StylePage />}
+            {activePage === 'diagnostics' && <DiagnosticsPage />}
+          </Suspense>
         </main>
       </div>
 
@@ -155,7 +181,9 @@ export default function App() {
       <OverlayPill />
 
       {/* Settings modal & toasts */}
-      <SettingsModal />
+      <Suspense fallback={null}>
+        <SettingsModal />
+      </Suspense>
       <ToastStack />
     </div>
   );

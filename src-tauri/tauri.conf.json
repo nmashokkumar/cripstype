@@ -22,21 +22,6 @@
         "minHeight": 580,
         "resizable": true,
         "visible": true
-      },
-      {
-        "label": "overlay",
-        "title": "CrispType Overlay",
-        "url": "/overlay",
-        "width": 380,
-        "height": 96,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "focus": false,
-        "shadow": false,
-        "visible": false
       }
     ],
     "security": {

@@ -182,6 +182,7 @@ interface FlowState {
   dismissBanner: (key: keyof DismissedBanners) => void;
 
   // Dictionary CRUD (persisted in IndexedDB)
+  initPersistedSettings: () => Promise<void>;
   initDictionary: () => Promise<void>;
   addDictionaryEntry: (entry: Omit<DictionaryEntry, 'id' | 'createdAt' | 'scope'>) => void;
   updateDictionaryEntry: (id: string, updates: Partial<Omit<DictionaryEntry, 'id'>>) => void;
@@ -246,17 +247,25 @@ function loadInitialSettings(): AppSettings {
 const initialSettings = loadInitialSettings();
 
 export const useFlowStore = create<FlowState>((set, get) => {
+  let lastOverlayVisible: boolean | null = null;
+  let lastOverlayInteractive: boolean | null = null;
+
   const broadcastOverlay = () => {
     const s = get();
+    const isVisible = s.overlayState !== 'idle';
     const shouldAllowClicks =
       (s.overlayState === 'listening' &&
         (s.activeRecordingMode ?? s.settings.dictationMode) === 'hands_free') ||
       s.overlayState === 'error';
 
-    if (!isOverlayWindowContext()) {
-      platform.setOverlayVisible(s.overlayState !== 'idle');
+    if (!isOverlayWindowContext() && lastOverlayVisible !== isVisible) {
+      lastOverlayVisible = isVisible;
+      platform.setOverlayVisible(isVisible);
     }
-    platform.setOverlayInteractive(shouldAllowClicks);
+    if (lastOverlayInteractive !== shouldAllowClicks) {
+      lastOverlayInteractive = shouldAllowClicks;
+      platform.setOverlayInteractive(shouldAllowClicks);
+    }
 
     const payload = {
       type: 'state' as const,
@@ -269,6 +278,16 @@ export const useFlowStore = create<FlowState>((set, get) => {
     };
 
     overlayChannel?.postMessage(payload);
+    const tauriInvoke = typeof window !== 'undefined' ? window.__TAURI__?.core?.invoke : undefined;
+    if (!isOverlayWindowContext() && typeof tauriInvoke === 'function') {
+      void tauriInvoke('update_overlay_state', {
+        overlayState: s.overlayState,
+        isHandsFree: (s.activeRecordingMode ?? s.settings.dictationMode) === 'hands_free',
+        elapsedMs: s.recordingElapsedMs,
+        audioLevels: s.audioLevels,
+        errorMessage: s.overlayError,
+      }).catch(() => undefined);
+    }
     const tauriEmit = typeof window !== 'undefined' ? window.__TAURI__?.event?.emit : undefined;
     if (!isOverlayWindowContext() && typeof tauriEmit === 'function') {
       void tauriEmit('crisptype:overlay-state', payload).catch(() => undefined);
@@ -365,6 +384,15 @@ export const useFlowStore = create<FlowState>((set, get) => {
       set((state) => {
         const next = { ...state.settings, ...partial, mockMode: false };
         writeJson(SETTINGS_KEY, next);
+        const tauriInvoke =
+          typeof window !== 'undefined'
+            ? (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+            : undefined;
+        if (typeof tauriInvoke === 'function') {
+          void tauriInvoke('save_persisted_config', { json: JSON.stringify(next) }).catch(
+            () => undefined
+          );
+        }
         if (
           partial.micDeviceId !== undefined &&
           partial.micDeviceId !== state.settings.micDeviceId
@@ -418,6 +446,40 @@ export const useFlowStore = create<FlowState>((set, get) => {
         writeJson(DISMISSED_KEY, next);
         return { dismissed: next };
       }),
+
+    initPersistedSettings: async () => {
+      const tauriInvoke =
+        typeof window !== 'undefined'
+          ? (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+          : undefined;
+      if (typeof tauriInvoke !== 'function') return;
+      try {
+        const raw = await tauriInvoke<string | null>('load_persisted_config');
+        if (raw) {
+          const parsed = JSON.parse(raw) as Partial<AppSettings>;
+          set((state) => {
+            const merged: AppSettings = {
+              ...state.settings,
+              ...parsed,
+              serverUrl:
+                typeof parsed.serverUrl === 'string' && parsed.serverUrl.trim()
+                  ? parsed.serverUrl.trim()
+                  : state.settings.serverUrl,
+              mockMode: false,
+            };
+            writeJson(SETTINGS_KEY, merged);
+            return { settings: merged };
+          });
+        } else {
+          // Seed native config file from current settings so it survives WebKit exit
+          void tauriInvoke('save_persisted_config', {
+            json: JSON.stringify(get().settings),
+          }).catch(() => undefined);
+        }
+      } catch {
+        // Ignore config read errors
+      }
+    },
 
     initDictionary: async () => {
       try {

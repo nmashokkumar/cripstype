@@ -395,41 +395,50 @@ export class AudioCaptureController {
 
       this.isRecording = true;
 
-      // Record compressed audio Blob in parallel for IndexedDB playback & batch re-transcribe
-      const mimeType =
-        typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-          ? 'audio/webm;codecs=opus'
-          : typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/webm')
-            ? 'audio/webm'
+      // Record compressed audio Blob in parallel for IndexedDB playback & batch re-transcribe.
+      // Wrapped in try/catch because some webviews (e.g. Linux WebKitGTK) expose MediaRecorder
+      // but throw NotSupportedError on construction/start; stop() falls back to WAV from pcmArchive.
+      try {
+        const mimeType =
+          typeof MediaRecorder !== 'undefined' && typeof MediaRecorder.isTypeSupported === 'function'
+            ? MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+              ? 'audio/webm;codecs=opus'
+              : MediaRecorder.isTypeSupported('audio/webm')
+                ? 'audio/webm'
+                : ''
             : '';
 
-      if (typeof MediaRecorder !== 'undefined' && this.stream) {
-        this.recorder = mimeType
-          ? new MediaRecorder(this.stream, { mimeType })
-          : new MediaRecorder(this.stream);
+        if (typeof MediaRecorder !== 'undefined' && this.stream) {
+          this.recorder = mimeType
+            ? new MediaRecorder(this.stream, { mimeType })
+            : new MediaRecorder(this.stream);
 
-        this.recorder.ondataavailable = (ev) => {
-          if (ev.data && ev.data.size > 0) {
-            this.chunks.push(ev.data);
-          }
-        };
+          this.recorder.ondataavailable = (ev) => {
+            if (ev.data && ev.data.size > 0) {
+              this.chunks.push(ev.data);
+            }
+          };
 
-        this.recorder.onstop = () => {
-          const durationMs = Math.max(400, Math.round(performance.now() - this.startedAt));
-          const blob =
-            this.chunks.length > 0
-              ? new Blob(this.chunks, { type: mimeType || 'audio/webm' })
-              : encodePcm16ToWavBlob(this.pcmArchive, TARGET_SAMPLE_RATE);
-          const resolve = this.stopResolver;
-          this.stopResolver = null;
-          this.recorder = null;
-          this.chunks = [];
-          this.pcmArchive = [];
-          this.enterWarmStandby();
-          resolve?.({ blob, durationMs, simulated: false });
-        };
+          this.recorder.onstop = () => {
+            const durationMs = Math.max(400, Math.round(performance.now() - this.startedAt));
+            const blob =
+              this.chunks.length > 0
+                ? new Blob(this.chunks, { type: mimeType || 'audio/webm' })
+                : encodePcm16ToWavBlob(this.pcmArchive, TARGET_SAMPLE_RATE);
+            const resolve = this.stopResolver;
+            this.stopResolver = null;
+            this.recorder = null;
+            this.chunks = [];
+            this.pcmArchive = [];
+            this.enterWarmStandby();
+            resolve?.({ blob, durationMs, simulated: false });
+          };
 
-        this.recorder.start(120);
+          this.recorder.start(120);
+        }
+      } catch {
+        this.recorder = null;
+        this.chunks = [];
       }
 
       this.startMeterLoop(options.silenceTimeoutMs, maxDurationMs, options.callbacks);
@@ -500,11 +509,11 @@ export class AudioCaptureController {
         callbacks.onSilenceTimeout?.();
         return;
       }
-
-      this.rafId = requestAnimationFrame(tick);
     };
 
-    this.rafId = requestAnimationFrame(tick);
+    // Use setInterval (~20 FPS) instead of requestAnimationFrame so RMS & elapsed timer
+    // continue updating reliably even when the main window is hidden in the system tray.
+    this.rafId = window.setInterval(tick, 50);
   }
 
   private startSimulatedMeterLoop(
@@ -546,18 +555,18 @@ export class AudioCaptureController {
         callbacks.onSilenceTimeout?.();
         return;
       }
-
-      this.rafId = requestAnimationFrame(tick);
     };
 
-    this.rafId = requestAnimationFrame(tick);
+    // Use setInterval (~20 FPS) instead of requestAnimationFrame so RMS & elapsed timer
+    // continue updating reliably even when the main window is hidden in the system tray.
+    this.rafId = window.setInterval(tick, 50);
   }
 
   async stop(): Promise<AudioRecordingResult> {
     // Flip recording gate off first so no new live chunks enter packetizer after flush
     this.isRecording = false;
     if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId);
+      window.clearInterval(this.rafId);
       this.rafId = null;
     }
 
@@ -706,7 +715,7 @@ export class AudioCaptureController {
     this.isSimulated = false;
     this.callbacks = null;
     if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId);
+      window.clearInterval(this.rafId);
       this.rafId = null;
     }
     this.recorder = null;

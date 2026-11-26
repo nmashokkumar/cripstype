@@ -1,6 +1,18 @@
 import type { DictationMode, HotkeyBinding } from '../types';
 import { classifyAppContext, type DetectedAppContext } from '../utils/appClassifier';
 
+export interface HotkeyConflict {
+  shortcut: string;
+  ownerName: string;
+  schema: string;
+  key: string;
+}
+
+export interface HotkeyApplyResult {
+  applied: boolean;
+  conflict: HotkeyConflict | null;
+}
+
 export interface NativeCommandHandlers {
   onStart: (mode?: DictationMode) => void;
   onStop: () => void;
@@ -29,6 +41,10 @@ export interface PlatformBridge {
   getAutoStart(): Promise<boolean | null>;
   setMinimizeToTray(enabled: boolean): Promise<void>;
   syncNativeHotkeys(bindings: { pushToTalk: HotkeyBinding; handsFree: HotkeyBinding }): void;
+  applyNativeHotkeysChecked(
+    bindings: { pushToTalk: HotkeyBinding; handsFree: HotkeyBinding },
+    forceReplace?: boolean
+  ): Promise<HotkeyApplyResult>;
   subscribeNativeCommands(handlers: NativeCommandHandlers): () => void;
 }
 
@@ -339,6 +355,27 @@ class CrossPlatformBridge implements PlatformBridge {
     } catch {
       // Ignore if host wrapper does not support dynamic hotkey updates
     }
+  }
+
+  async applyNativeHotkeysChecked(
+    bindings: { pushToTalk: HotkeyBinding; handsFree: HotkeyBinding },
+    forceReplace = false
+  ): Promise<HotkeyApplyResult> {
+    if (typeof window === 'undefined') return { applied: true, conflict: null };
+    const tauriInvoke = getTauriInvoke();
+    if (tauriInvoke) {
+      try {
+        return await tauriInvoke<HotkeyApplyResult>('apply_hotkeys', {
+          pushToTalk: bindings.pushToTalk,
+          handsFree: bindings.handsFree,
+          forceReplace,
+        });
+      } catch {
+        return { applied: true, conflict: null };
+      }
+    }
+    this.syncNativeHotkeys(bindings);
+    return { applied: true, conflict: null };
   }
 
   subscribeNativeCommands(handlers: NativeCommandHandlers): () => void {

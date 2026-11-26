@@ -61,6 +61,12 @@ export function SettingsModal() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [showSelfHost, setShowSelfHost] = useState(false);
   const [copiedInstall, setCopiedInstall] = useState(false);
+  const [pendingConflict, setPendingConflict] = useState<{
+    target: DictationMode;
+    binding: HotkeyBinding;
+    shortcut: string;
+    ownerName: string;
+  } | null>(null);
   const [testingConn, setTestingConn] = useState(false);
   const [connStatus, setConnStatus] = useState<ServerHealthResult | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -96,16 +102,9 @@ export function SettingsModal() {
     let pendingModifierCombo: HotkeyBinding | null = null;
 
     const commitBinding = (binding: HotkeyBinding) => {
-      if (capturingTarget === 'push_to_talk') {
-        updateSettings({ pushToTalkHotkey: binding });
-      } else {
-        updateSettings({ handsFreeHotkey: binding });
-      }
       setCapturingTarget(null);
       setLivePreviewLabel('');
-      pushToast(
-        `${capturingTarget === 'push_to_talk' ? 'Push-to-talk' : 'Hands-free'} set to ${binding.label}`
-      );
+      void tryApplyHotkey(capturingTarget, binding, false);
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -183,7 +182,31 @@ export function SettingsModal() {
     setTimeout(() => setCopiedInstall(false), 1800);
   };
 
-  const applyHotkeyPreset = (target: DictationMode, binding: HotkeyBinding) => {
+  const tryApplyHotkey = async (
+    target: DictationMode,
+    binding: HotkeyBinding,
+    forceReplace = false
+  ) => {
+    if (target === 'hands_free' && platform.isTauriHost) {
+      const res = await platform.applyNativeHotkeysChecked(
+        {
+          pushToTalk: settings.pushToTalkHotkey,
+          handsFree: binding,
+        },
+        forceReplace
+      );
+      if (!res.applied && res.conflict) {
+        setPendingConflict({
+          target,
+          binding,
+          shortcut: res.conflict.shortcut || binding.label,
+          ownerName: res.conflict.ownerName,
+        });
+        return;
+      }
+    }
+
+    setPendingConflict(null);
     if (target === 'push_to_talk') {
       updateSettings({ pushToTalkHotkey: binding });
       pushToast(`Push-to-talk set to ${binding.label}`);
@@ -191,7 +214,11 @@ export function SettingsModal() {
       updateSettings({ handsFreeHotkey: binding });
       pushToast(`Hands-free set to ${binding.label}`);
     }
+  };
+
+  const applyHotkeyPreset = (target: DictationMode, binding: HotkeyBinding) => {
     setCapturingTarget(null);
+    void tryApplyHotkey(target, binding, false);
   };
 
   const pttIsDefault = isSameHotkeyBinding(settings.pushToTalkHotkey, DEFAULT_PTT_HOTKEY);
@@ -808,6 +835,46 @@ export function SettingsModal() {
           )}
         </div>
       </div>
+      {/* Settings modal & conflict confirmation */}
+      {pendingConflict && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-4"
+          role="alertdialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-[400px] rounded-[18px] bg-[var(--flow-surface)] border border-[var(--flow-border)] p-5 shadow-2xl space-y-4">
+            <div className="space-y-1.5">
+              <h3 className="text-[15px] font-semibold text-[var(--flow-text)]">
+                Shortcut Already In Use
+              </h3>
+              <p className="text-[13px] text-[var(--flow-text-secondary)] leading-relaxed">
+                <span className="font-medium text-[var(--flow-text)]">{pendingConflict.shortcut}</span>{' '}
+                is already assigned to{' '}
+                <span className="font-medium text-[var(--flow-text)]">{pendingConflict.ownerName}</span>.
+                Do you want to replace it and assign it to CrispType?
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingConflict(null)}
+                className="px-3.5 py-1.5 rounded-[10px] text-[13px] font-medium border border-[var(--flow-border)] text-[var(--flow-text-secondary)] hover:bg-[var(--flow-surface-hover)] cursor-pointer"
+              >
+                Keep Previous
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void tryApplyHotkey(pendingConflict.target, pendingConflict.binding, true)
+                }
+                className="px-3.5 py-1.5 rounded-[10px] text-[13px] font-medium bg-[var(--flow-accent)] text-white hover:opacity-90 cursor-pointer"
+              >
+                Replace Shortcut
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
