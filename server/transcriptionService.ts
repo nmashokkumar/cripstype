@@ -10,6 +10,8 @@ import {
   resolveUpstreamCleanupEndpoint,
   resolveUpstreamTranscribeEndpoint,
   stripDictionaryEcho,
+  stripTranscriptDelimiters,
+  wrapUntrustedTranscript,
   type ParsedTranscribeRequest,
   type UpstreamTranscribeFormat,
 } from './openwhisprPipeline.ts';
@@ -86,7 +88,7 @@ export function readBackendConfig(): BackendRuntimeConfig {
     upstreamCleanupUrl: (process.env.UPSTREAM_CLEANUP_URL ?? '').trim(),
     upstreamCleanupModel: (process.env.UPSTREAM_CLEANUP_MODEL ?? 'gpt-4o-mini').trim() || 'gpt-4o-mini',
     upstreamCleanupApiKey: (process.env.UPSTREAM_CLEANUP_API_KEY ?? '').trim(),
-    flowApiKey: (process.env.FLOW_API_KEY ?? '').trim(),
+    flowApiKey: (process.env.CRISPTYPE_API_KEY ?? process.env.FLOW_API_KEY ?? '').trim(),
   };
 }
 
@@ -217,9 +219,8 @@ async function transcribeViaUpstream(
     });
 
     if (!response.ok) {
-      const errBody = await response.text().catch(() => '');
       throw new TranscriptionServiceError(
-        `Upstream transcription server error (${response.status}): ${errBody.slice(0, 180) || response.statusText}`,
+        `Upstream transcription server returned HTTP ${response.status}.`,
         response.status >= 400 && response.status < 600 ? response.status : 502
       );
     }
@@ -263,7 +264,7 @@ async function transcribeViaUpstream(
       throw new TranscriptionServiceError('Upstream transcription request timed out.', 504);
     }
     throw new TranscriptionServiceError(
-      `Could not reach upstream transcription server: ${err instanceof Error ? err.message : 'Network error'}`,
+      'Could not reach upstream transcription server. Verify server availability.',
       502
     );
   } finally {
@@ -317,9 +318,8 @@ async function transcribeViaGemini(
       provider: 'gemini',
       model: GEMINI_TRANSCRIBE_MODEL,
     };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Gemini transcription failed';
-    throw new TranscriptionServiceError(`Gemini transcription error: ${message}`, 502);
+  } catch {
+    throw new TranscriptionServiceError('Transcription backend failed to process audio.', 502);
   }
 }
 
@@ -362,7 +362,7 @@ async function polishViaUpstreamLlm(
         model: cfg.upstreamCleanupModel,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: rawText },
+          { role: 'user', content: wrapUntrustedTranscript(rawText) },
         ],
       }),
       signal: controller.signal,
@@ -372,7 +372,8 @@ async function polishViaUpstreamLlm(
     const data = (await res.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const cleaned = data.choices?.[0]?.message?.content?.trim();
+    const rawCleaned = data.choices?.[0]?.message?.content?.trim();
+    const cleaned = rawCleaned ? stripTranscriptDelimiters(rawCleaned) : '';
     if (!cleaned || isDuplicatedCleanupOutput(rawText, cleaned)) {
       return null;
     }
@@ -401,7 +402,7 @@ async function polishViaGemini(
   try {
     const response = await ai.models.generateContent({
       model: GEMINI_CLEANUP_MODEL,
-      contents: rawText,
+      contents: wrapUntrustedTranscript(rawText),
       config: {
         systemInstruction,
         thinkingConfig: {
@@ -410,7 +411,7 @@ async function polishViaGemini(
       },
     });
 
-    const cleaned = (response.text ?? '').trim();
+    const cleaned = stripTranscriptDelimiters((response.text ?? '').trim());
     if (!cleaned || isDuplicatedCleanupOutput(rawText, cleaned)) {
       return null;
     }

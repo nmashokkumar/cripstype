@@ -27,11 +27,9 @@ import {
 } from '../services/db';
 import {
   DEFAULT_CLEANUP_CONFIG,
-  LIVE_SEAMLESS_SERVER_URL,
   StreamingDictationSession,
   batchTranscribeAudio,
   getDefaultServerUrl,
-  runMockTranscription,
 } from '../services/api';
 import {
   AudioCaptureController,
@@ -52,8 +50,8 @@ import {
   countWords,
 } from '../utils/textPipeline';
 
-const SETTINGS_KEY = 'flow_settings_v1';
-const SETTINGS_MIGRATION_V2_KEY = 'flow_settings_seamless_v2';
+const SETTINGS_KEY = 'crisptype_settings_v1';
+const LEGACY_SETTINGS_KEY = 'flow_settings_v1';
 const STYLES_KEY = 'flow_styles_v1';
 const DISMISSED_KEY = 'flow_dismissed_v1';
 
@@ -214,25 +212,17 @@ interface FlowState {
 }
 
 function loadInitialSettings(): AppSettings {
-  const raw = readJson<Partial<AppSettings>>(SETTINGS_KEY, DEFAULT_SETTINGS);
-  let serverUrl = raw.serverUrl || getDefaultServerUrl();
-  let silenceTimeoutSec =
-    typeof raw.silenceTimeoutSec === 'number' ? raw.silenceTimeoutSec : 5;
-
-  if (typeof window !== 'undefined' && !window.localStorage.getItem(SETTINGS_MIGRATION_V2_KEY)) {
-    const looksLikeOldDefault =
-      !serverUrl ||
-      serverUrl === 'http://localhost:8000' ||
-      serverUrl === 'http://localhost:3000' ||
-      serverUrl === window.location.origin;
-    if (looksLikeOldDefault) {
-      serverUrl = LIVE_SEAMLESS_SERVER_URL;
-    }
-    if (silenceTimeoutSec === 3) {
-      silenceTimeoutSec = 5;
-    }
-    window.localStorage.setItem(SETTINGS_MIGRATION_V2_KEY, '1');
+  const hasNewKey = typeof window !== 'undefined' && Boolean(window.localStorage.getItem(SETTINGS_KEY));
+  const raw = readJson<Partial<AppSettings>>(
+    hasNewKey ? SETTINGS_KEY : LEGACY_SETTINGS_KEY,
+    DEFAULT_SETTINGS
+  );
+  let serverUrl = (raw.serverUrl || '').trim();
+  if (!serverUrl || serverUrl.includes('instabox.tech')) {
+    serverUrl = getDefaultServerUrl();
   }
+  const silenceTimeoutSec =
+    typeof raw.silenceTimeoutSec === 'number' ? raw.silenceTimeoutSec : 5;
 
   const normalized: AppSettings = {
     serverUrl,
@@ -574,7 +564,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
       try {
         let updated: HistoryEntry;
 
-        if (storedEntry.audioBlob && storedEntry.audioBlob.size > 32 && !state.settings.mockMode) {
+        if (storedEntry.audioBlob && storedEntry.audioBlob.size > 32) {
           set({ overlayState: 'transcribing', activeStage: 'polish', overlayError: null });
           broadcastOverlay();
 
@@ -593,7 +583,6 @@ export const useFlowStore = create<FlowState>((set, get) => {
             {
               baseUrl: state.settings.serverUrl,
               apiKey: state.settings.apiKey,
-              mockMode: false,
             }
           );
 
@@ -635,12 +624,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
               reprocessed.correctionsAppliedCount
             ),
           };
-          get().pushToast(
-            storedEntry.audioBlob
-              ? 'Re-processed locally (Offline demo mode)'
-              : 'Re-processed with updated Style & Dictionary',
-            'success'
-          );
+          get().pushToast('Re-processed with updated Style & Dictionary', 'success');
         }
 
         await saveHistoryEntry(updated);
@@ -710,32 +694,30 @@ export const useFlowStore = create<FlowState>((set, get) => {
         freshState.stylesByContext
       );
 
-      if (!freshState.settings.mockMode) {
-        try {
-          const wsSession = new StreamingDictationSession({
-            baseUrl: freshState.settings.serverUrl,
-            model: freshState.settings.asrModel,
-            appContext: detectedApp.appName,
-            appCategory: detectedApp.category,
-            preset,
-            styleMap: freshState.stylesByContext,
-            cleanup: freshState.cleanupConfig,
-            dictionary: freshState.dictionary,
-            apiKey: freshState.settings.apiKey,
-          });
-          wsSession.connect();
-          activeWsSession = wsSession;
-        } catch (err) {
-          const message = err instanceof Error ? err.message : 'Invalid server URL for WebSocket.';
-          set({
-            overlayState: 'error',
-            activeRecordingMode: null,
-            overlayError: message,
-          });
-          broadcastOverlay();
-          get().pushToast(message, 'error');
-          return;
-        }
+      try {
+        const wsSession = new StreamingDictationSession({
+          baseUrl: freshState.settings.serverUrl,
+          model: freshState.settings.asrModel,
+          appContext: detectedApp.appName,
+          appCategory: detectedApp.category,
+          preset,
+          styleMap: freshState.stylesByContext,
+          cleanup: freshState.cleanupConfig,
+          dictionary: freshState.dictionary,
+          apiKey: freshState.settings.apiKey,
+        });
+        wsSession.connect();
+        activeWsSession = wsSession;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Invalid server URL for WebSocket.';
+        set({
+          overlayState: 'error',
+          activeRecordingMode: null,
+          overlayError: message,
+        });
+        broadcastOverlay();
+        get().pushToast(message, 'error');
+        return;
       }
 
       const silenceTimeoutMs =
@@ -748,7 +730,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
           deviceId: freshState.settings.micDeviceId,
           silenceTimeoutMs,
           maxDurationMs: MAX_MONOLOGUE_DURATION_MS,
-          allowSimulatedFallback: freshState.settings.mockMode,
+          allowSimulatedFallback: false,
           callbacks: {
             onLevels: (bars) => {
               set({ audioLevels: bars });
@@ -815,7 +797,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
       if (state.overlayState !== 'listening') return;
 
       // Invalidate any pending async mic setup if stop is pressed while initializing
-      if (!activeWsSession && !state.settings.mockMode) {
+      if (!activeWsSession) {
         pendingStopDuringStart = true;
       }
 
@@ -836,15 +818,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
         const fresh = get();
 
         let result;
-        if (fresh.settings.mockMode) {
-          result = await runMockTranscription(fresh.dictionary, {
-            language: 'en',
-            style: preset,
-            context: detectedApp.category,
-            cleanup: fresh.cleanupConfig,
-            appContext: detectedApp.appName,
-          });
-        } else if (wsSession) {
+        if (wsSession) {
           try {
             result = await wsSession.finish(recording.durationMs);
           } catch (wsErr) {
@@ -864,7 +838,6 @@ export const useFlowStore = create<FlowState>((set, get) => {
                 {
                   baseUrl: fresh.settings.serverUrl,
                   apiKey: fresh.settings.apiKey,
-                  mockMode: false,
                 }
               );
             } else {
@@ -887,7 +860,6 @@ export const useFlowStore = create<FlowState>((set, get) => {
             {
               baseUrl: fresh.settings.serverUrl,
               apiKey: fresh.settings.apiKey,
-              mockMode: false,
             }
           );
         }
@@ -946,7 +918,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
         broadcastOverlay();
 
         get().pushToast(
-          inserted ? 'Pasted & copied to clipboard' : 'Copied to clipboard',
+          inserted ? 'Pasted & copied to clipboard' : 'Copied to clipboard — press Ctrl+V to paste',
           'success'
         );
 

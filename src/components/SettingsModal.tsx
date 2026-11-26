@@ -40,7 +40,7 @@ import type { DictationMode, HotkeyBinding } from '../types';
 type SettingsTab = 'server' | 'shortcuts' | 'audio';
 
 const ONE_COMMAND_INSTALL =
-  'git clone https://github.com/nmashokkumar/my_wispr.git && cd my_wispr/backend && bash install.sh';
+  'git clone https://github.com/<your-org>/crisptype.git && cd crisptype/backend && bash setup.sh';
 
 export function SettingsModal() {
   const settingsOpen = useFlowStore((s) => s.settingsOpen);
@@ -159,7 +159,6 @@ export function SettingsModal() {
     const result = await checkServerHealth({
       baseUrl: settings.serverUrl,
       apiKey: settings.apiKey,
-      mockMode: false,
     });
     setConnStatus(result);
     setTestingConn(false);
@@ -288,7 +287,7 @@ export function SettingsModal() {
                       updateSettings({ serverUrl: e.target.value });
                       setConnStatus(null);
                     }}
-                    placeholder="https://your-server.instabox.tech"
+                    placeholder="https://your-server.example.com"
                     className="w-full h-10 rounded-[11px] border border-[var(--flow-border)] bg-[var(--flow-panel-bg)] dark:bg-[#191917] px-3.5 text-[13.5px] text-[var(--flow-text)] dark:text-[#F2F1EC] placeholder:text-[var(--flow-text-muted)] focus:outline-none focus:border-[var(--flow-accent)]"
                   />
                 </div>
@@ -373,7 +372,7 @@ export function SettingsModal() {
                   aria-expanded={showSelfHost}
                   className="flex items-center justify-between w-full py-1.5 text-[12.5px] font-medium text-[var(--flow-text-secondary)] hover:text-[var(--flow-text)] transition-colors cursor-pointer"
                 >
-                  <span>Host your own free server (Instabox / Linux / Docker)</span>
+                  <span>Host your own server (Linux / Docker / Cloud VM)</span>
                   <ChevronDown
                     size={15}
                     className={`transition-transform duration-150 ${showSelfHost ? 'rotate-180' : ''}`}
@@ -383,8 +382,8 @@ export function SettingsModal() {
                 {showSelfHost && (
                   <div className="mt-2 rounded-[12px] bg-[var(--flow-surface-muted)] border border-[var(--flow-border-subtle)] p-3 space-y-2">
                     <p className="text-[12px] leading-relaxed text-[var(--flow-text-secondary)]">
-                      Open an Instabox.sh VM or any Linux server and run this single command. It compiles
-                      native C++ Silero VAD, starts the server, and prints your link to paste above.
+                      Run this single command on any Ubuntu/Debian Linux machine or cloud VM. It builds
+                      native Silero VAD, generates an API key, and prints your Server URL to paste above.
                     </p>
                     <div className="flex items-center gap-2 rounded-[9px] bg-[var(--flow-surface)] border border-[var(--flow-border)] px-2.5 py-2">
                       <code className="flex-1 text-[11.5px] font-mono text-[var(--flow-text)] truncate select-all">

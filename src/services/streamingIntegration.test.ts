@@ -72,10 +72,12 @@ function parseWsFrames(buf: Buffer): { frames: ParsedWsFrame[]; remainder: Buffe
 test('StreamingDictationSession streams exact 1,024-byte (32ms @ 16kHz) PCM packets and receives final transcript', async () => {
   let receivedStart: Record<string, unknown> | null = null;
   let receivedStop = false;
+  let upgradeUrl = '';
   const binaryFrameSizes: number[] = [];
 
   const server = http.createServer();
   server.on('upgrade', (req, socket: Duplex) => {
+    upgradeUrl = req.url ?? '';
     const key = req.headers['sec-websocket-key'];
     assert.ok(typeof key === 'string');
     const accept = crypto
@@ -139,6 +141,7 @@ test('StreamingDictationSession streams exact 1,024-byte (32ms @ 16kHz) PCM pack
   try {
     const session = new StreamingDictationSession({
       baseUrl,
+      apiKey: 'ct_test_secret_key',
       appContext: 'Gmail',
       appCategory: 'email',
       preset: 'formal',
@@ -167,7 +170,9 @@ test('StreamingDictationSession streams exact 1,024-byte (32ms @ 16kHz) PCM pack
 
     const result = await session.finish(350);
 
+    assert.equal(upgradeUrl.includes('api_key'), false, 'API key must never appear in WebSocket URL query string');
     assert.ok(receivedStart, 'Server must receive start handshake JSON');
+    assert.equal(receivedStart['api_key'], 'ct_test_secret_key');
     assert.equal(receivedStart['app_context'], 'Gmail');
     assert.equal(receivedStart['app_category'], 'email');
     assert.equal(receivedStart['preset'], 'formal');

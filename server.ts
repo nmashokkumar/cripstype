@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, type RawData, type WebSocket as WsSocket } from 'ws';
 import {
+  SlidingWindowRateLimiter,
   isAuthorizedApiKey,
   normalizeAudioMimeType,
   parseTranscribeRequestFields,
@@ -25,22 +26,42 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25 MB
+const MAX_WS_FRAME_BYTES = 256 * 1024; // 256 KB per WS frame
+const MAX_CONCURRENT_WS_PER_IP = Math.max(1, Number(process.env.CRISPTYPE_MAX_WS_PER_IP) || 8);
+const RATE_LIMIT_RPM = Math.max(10, Number(process.env.CRISPTYPE_RATE_LIMIT_RPM) || 60);
+
+const httpRateLimiter = new SlidingWindowRateLimiter({
+  maxRequests: RATE_LIMIT_RPM,
+  windowMs: 60_000,
+});
+const activeWsByIp = new Map<string, number>();
 
 const ALLOWED_LOCAL_ORIGIN_PATTERNS = [
   /^https?:\/\/localhost(?::\d+)?$/i,
   /^https?:\/\/127\.0\.0\.1(?::\d+)?$/i,
   /^app:\/\/.+$/i,
   /^tauri:\/\/localhost$/i,
+  /^https?:\/\/tauri\.localhost$/i,
   /^capacitor:\/\/localhost$/i,
 ];
 
+function extractClientIp(req: http.IncomingMessage): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
 function isOriginAllowed(origin: string, reqHost?: string): boolean {
-  const configured = (process.env.CORS_ORIGINS ?? '')
+  const configured = (process.env.CRISPTYPE_CORS_ORIGINS ?? process.env.CORS_ORIGINS ?? '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
 
-  if (configured.includes('*')) {
+  // Never allow wildcard "*" when API key authentication is enabled
+  const { flowApiKey } = readBackendConfig();
+  if (configured.includes('*') && !flowApiKey) {
     return true;
   }
   if (configured.includes(origin)) {
@@ -93,6 +114,19 @@ function corsMiddleware(req: Request, res: Response, next: NextFunction): void {
     return;
   }
 
+  next();
+}
+
+function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const ip = extractClientIp(req);
+  const verdict = httpRateLimiter.allow(ip);
+  if (!verdict.allowed) {
+    res.setHeader('Retry-After', String(verdict.retryAfterSec));
+    res.status(429).json({
+      error: 'Too many requests. Please slow down and try again shortly.',
+    });
+    return;
+  }
   next();
 }
 
@@ -210,17 +244,57 @@ function rawDataToBuffer(data: RawData): Buffer {
 }
 
 function attachWebSocketTranscription(wss: WebSocketServer): void {
-  wss.on('connection', (ws: WsSocket) => {
+  wss.on('connection', (ws: WsSocket, request: http.IncomingMessage) => {
+    const clientIp = extractClientIp(request);
+    activeWsByIp.set(clientIp, (activeWsByIp.get(clientIp) ?? 0) + 1);
+
+    const { flowApiKey } = readBackendConfig();
+    const reqUrl = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+    const queryKey = reqUrl.searchParams.get('api_key') ?? undefined;
+    let isAuthenticated =
+      !flowApiKey ||
+      isAuthorizedApiKey(flowApiKey, {
+        apiKeyHeader:
+          typeof request.headers['x-api-key'] === 'string'
+            ? request.headers['x-api-key']
+            : queryKey,
+        authorizationHeader:
+          typeof request.headers.authorization === 'string'
+            ? request.headers.authorization
+            : undefined,
+      });
+
     const pcmChunks: Buffer[] = [];
     let packetsReceived = 0;
     let pcmBytesReceived = 0;
     let startFields: Record<string, unknown> = {};
     let finished = false;
 
+    const clearAudioBuffers = () => {
+      for (const buf of pcmChunks) {
+        buf.fill(0);
+      }
+      pcmChunks.length = 0;
+    };
+
+    ws.on('close', () => {
+      clearAudioBuffers();
+      const remaining = (activeWsByIp.get(clientIp) ?? 1) - 1;
+      if (remaining <= 0) {
+        activeWsByIp.delete(clientIp);
+      } else {
+        activeWsByIp.set(clientIp, remaining);
+      }
+    });
+
     ws.on('message', (data: RawData, isBinary: boolean) => {
       if (finished) return;
 
       if (isBinary) {
+        if (!isAuthenticated) {
+          ws.close(4401, 'Unauthorized');
+          return;
+        }
         const chunk = rawDataToBuffer(data);
         packetsReceived += 1;
         if (pcmBytesReceived + chunk.length <= MAX_WS_PCM_BYTES) {
@@ -239,6 +313,18 @@ function attachWebSocketTranscription(wss: WebSocketServer): void {
       }
 
       if (payload.type === 'start') {
+        if (!isAuthenticated) {
+          const frameKey = typeof payload.api_key === 'string' ? payload.api_key : undefined;
+          if (!isAuthorizedApiKey(flowApiKey, { apiKeyHeader: frameKey })) {
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ status: 'error', error: 'Unauthorized API key.' }));
+            }
+            ws.close(4401, 'Unauthorized API key');
+            return;
+          }
+          isAuthenticated = true;
+        }
+
         startFields = {
           model: payload.model,
           style: payload.preset,
@@ -266,10 +352,15 @@ function attachWebSocketTranscription(wss: WebSocketServer): void {
       }
 
       if (payload.type === 'stop') {
+        if (!isAuthenticated) {
+          ws.close(4401, 'Unauthorized');
+          return;
+        }
         finished = true;
         void (async () => {
           const startedAt = Date.now();
           const rawPcm = Buffer.concat(pcmChunks);
+          clearAudioBuffers();
           const evenBytes = rawPcm.length - (rawPcm.length % 2);
           const audioMs = Math.round((evenBytes / 2 / TARGET_SAMPLE_RATE) * 1000);
           const parsedFields = parseTranscribeRequestFields(startFields);
@@ -349,9 +440,7 @@ function attachWebSocketTranscription(wss: WebSocketServer): void {
             const msg =
               err instanceof TranscriptionServiceError
                 ? err.message
-                : err instanceof Error
-                  ? err.message
-                  : 'Streaming transcription failed.';
+                : 'Streaming transcription failed.';
             if (ws.readyState === ws.OPEN) {
               ws.send(
                 JSON.stringify({
@@ -362,6 +451,8 @@ function attachWebSocketTranscription(wss: WebSocketServer): void {
                 })
               );
             }
+          } finally {
+            rawPcm.fill(0);
           }
         })();
       }
@@ -374,14 +465,15 @@ async function startServer(): Promise<void> {
   app.disable('x-powered-by');
   app.use(corsMiddleware);
 
-  // Health check routes (Flow client + shared server link monitors)
-  app.get(['/health', '/api/health', '/v1/health'], authMiddleware, (_req, res) => {
+  // Health check routes (CrispType client + shared server link monitors)
+  app.get(['/health', '/api/health', '/v1/health'], rateLimitMiddleware, authMiddleware, (_req, res) => {
     res.json(getBackendHealthStatus());
   });
 
-  // Primary Flow transcription route
+  // Primary CrispType transcription route
   app.post(
     ['/transcribe', '/api/transcribe', '/v1/transcribe'],
+    rateLimitMiddleware,
     authMiddleware,
     acceptAudioUpload,
     (req, res, next) => {
@@ -389,9 +481,10 @@ async function startServer(): Promise<void> {
     }
   );
 
-  // OpenWhispr / OpenAI & whisper.cpp compatible routes so external clients can share this server link directly
+  // OpenAI & whisper.cpp compatible routes so external clients can share this server link directly
   app.post(
     ['/v1/audio/transcriptions', '/audio/transcriptions', '/inference'],
+    rateLimitMiddleware,
     authMiddleware,
     acceptAudioUpload,
     (req, res, next) => {
@@ -399,7 +492,7 @@ async function startServer(): Promise<void> {
     }
   );
 
-  // Centralized error handler for API & multer upload errors
+  // Centralized error handler for API & multer upload errors (never leaks raw stack traces)
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) {
       next(err);
@@ -408,7 +501,7 @@ async function startServer(): Promise<void> {
 
     if (err instanceof multer.MulterError) {
       const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
-      res.status(status).json({ error: `Upload error: ${err.message}` });
+      res.status(status).json({ error: `Upload rejected: ${err.code}.` });
       return;
     }
 
@@ -417,9 +510,8 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const message = err instanceof Error ? err.message : 'Internal server error';
-    console.error(`[Flow Server] Error on ${req.method} ${req.path}:`, message);
-    res.status(500).json({ error: message });
+    console.error(`[CrispType Server] Unhandled error on ${req.method} ${req.path}`);
+    res.status(500).json({ error: 'Internal server error.' });
   });
 
   if (!IS_PRODUCTION) {
@@ -437,7 +529,7 @@ async function startServer(): Promise<void> {
   }
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_FRAME_BYTES });
   attachWebSocketTranscription(wss);
 
   server.on('upgrade', (request, socket, head) => {
@@ -447,23 +539,40 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    const clientIp = extractClientIp(request);
+    if ((activeWsByIp.get(clientIp) ?? 0) >= MAX_CONCURRENT_WS_PER_IP) {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // If API key is supplied on upgrade headers/query, validate immediately.
+    // Otherwise allow upgrade and require API key in the first JSON "start" frame
+    // so browser WebSocket clients never leak API keys in URL query logs.
     const { flowApiKey } = readBackendConfig();
     if (flowApiKey) {
-      const queryKey = reqUrl.searchParams.get('api_key') ?? undefined;
-      const authorized = isAuthorizedApiKey(flowApiKey, {
-        apiKeyHeader:
-          typeof request.headers['x-api-key'] === 'string'
-            ? request.headers['x-api-key']
-            : queryKey,
-        authorizationHeader:
-          typeof request.headers.authorization === 'string'
-            ? request.headers.authorization
-            : undefined,
-      });
-      if (!authorized) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-        socket.destroy();
-        return;
+      const hasUpgradeCredentials =
+        typeof request.headers['x-api-key'] === 'string' ||
+        typeof request.headers.authorization === 'string' ||
+        reqUrl.searchParams.has('api_key');
+
+      if (hasUpgradeCredentials) {
+        const queryKey = reqUrl.searchParams.get('api_key') ?? undefined;
+        const authorized = isAuthorizedApiKey(flowApiKey, {
+          apiKeyHeader:
+            typeof request.headers['x-api-key'] === 'string'
+              ? request.headers['x-api-key']
+              : queryKey,
+          authorizationHeader:
+            typeof request.headers.authorization === 'string'
+              ? request.headers.authorization
+              : undefined,
+        });
+        if (!authorized) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+          socket.destroy();
+          return;
+        }
       }
     }
 
@@ -475,7 +584,7 @@ async function startServer(): Promise<void> {
   server.listen(PORT, '0.0.0.0', () => {
     const health = getBackendHealthStatus();
     console.log(
-      `[Flow Server] Listening on http://0.0.0.0:${PORT} (mode=${health.mode}, provider=${health.provider}, cleanup=${health.cleanupProvider}, auth=${health.authRequired ? 'enabled' : 'open'})`
+      `[CrispType Server] Listening on http://0.0.0.0:${PORT} (mode=${health.mode}, provider=${health.provider}, cleanup=${health.cleanupProvider}, auth=${health.authRequired ? 'enabled' : 'open'})`
     );
   });
 }

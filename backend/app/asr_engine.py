@@ -1,12 +1,16 @@
 """
-Audio Decoding & ASR Inference Engine.
+Audio Decoding & Multi-Engine ASR Inference Engine for CrispType.
 
 Supports:
-- `faster_whisper` (default — fast, low VRAM/CPU via CTranslate2 int8/float16)
+- `parakeet` (NVIDIA Parakeet TDT via `onnx_asr` or NeMo — ultra-fast, high-accuracy STT)
+- `faster_whisper` (default zero-GPU-required CTranslate2 int8/float16 Whisper)
 - `seamless_m4t_v2` (Meta `facebook/seamless-m4t-v2-large` via Hugging Face Transformers)
 
-Handles both raw 16 kHz Int16 PCM streams (WebSocket) and arbitrary container
-uploads (`webm`, `wav`, `ogg`, `mp3`, `m4a`) decoded cleanly via `ffmpeg` or `soundfile`.
+Zero-retention guarantee:
+- WebSocket 16 kHz Int16 PCM streams are processed completely in memory.
+- Container uploads (`webm`, `wav`, `ogg`, `mp3`, `m4a`, `flac`) are decoded via
+  in-memory `soundfile` or an ephemeral temporary file guaranteed to be deleted
+  inside a `finally` block.
 """
 
 from __future__ import annotations
@@ -23,21 +27,40 @@ import numpy as np
 
 from .vad_bridge import SAMPLE_RATE, VadPipeline
 
-logger = logging.getLogger("flow.asr")
+logger = logging.getLogger("crisptype.asr")
 
 AVAILABLE_MODEL_PRESETS: List[str] = [
-    "seamless-m4t-v2",
+    "parakeet-tdt-0.6b-v2",
     "faster-whisper-distil-large-v3",
     "faster-whisper-large-v3-turbo",
+    "seamless-m4t-v2",
 ]
+
+ALLOWED_AUDIO_EXTENSIONS = frozenset({
+    ".webm",
+    ".wav",
+    ".ogg",
+    ".mp3",
+    ".m4a",
+    ".flac",
+    ".aac",
+    ".mp4",
+})
+
+FFMPEG_DECODE_TIMEOUT_SEC = 30
+
+
+def _sanitize_audio_suffix(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    return ext if ext in ALLOWED_AUDIO_EXTENSIONS else ".webm"
 
 
 def decode_audio_bytes_to_pcm16(audio_bytes: bytes, filename: str = "audio.webm") -> np.ndarray:
-    """Decodes webm/wav/ogg/mp3/m4a bytes into mono 16 kHz Int16 PCM numpy array."""
+    """Decodes container audio bytes into a mono 16 kHz Int16 PCM numpy array with zero disk retention."""
     if not audio_bytes:
         return np.empty(0, dtype=np.int16)
 
-    # Fast path for standard WAV via soundfile
+    # Fast in-memory path for standard WAV via soundfile
     if filename.lower().endswith(".wav") or audio_bytes[:4] == b"RIFF":
         try:
             import soundfile as sf  # type: ignore
@@ -57,10 +80,15 @@ def decode_audio_bytes_to_pcm16(audio_bytes: bytes, filename: str = "audio.webm"
             pass
 
     # Universal container decode via ffmpeg -> 16 kHz mono s16le PCM
-    suffix = os.path.splitext(filename)[1] or ".webm"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-        tmp.write(audio_bytes)
-        tmp.flush()
+    # Strict extension allowlist + explicit finally deletion ensures zero retention on disk.
+    suffix = _sanitize_audio_suffix(filename)
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.write(audio_bytes)
+            tmp.flush()
+
         proc = subprocess.run(
             [
                 "ffmpeg",
@@ -69,7 +97,7 @@ def decode_audio_bytes_to_pcm16(audio_bytes: bytes, filename: str = "audio.webm"
                 "-loglevel",
                 "error",
                 "-i",
-                tmp.name,
+                tmp_path,
                 "-ac",
                 "1",
                 "-ar",
@@ -80,12 +108,20 @@ def decode_audio_bytes_to_pcm16(audio_bytes: bytes, filename: str = "audio.webm"
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=FFMPEG_DECODE_TIMEOUT_SEC,
             check=False,
         )
         if proc.returncode != 0:
-            err_msg = proc.stderr.decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(f"ffmpeg failed to decode audio ({suffix}): {err_msg or 'unknown error'}")
+            raise RuntimeError("Audio container decoding failed.")
         return np.frombuffer(proc.stdout, dtype=np.int16).copy()
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Audio decoding timed out.") from exc
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _build_initial_prompt(dictionary: Optional[List[Mapping[str, Any]]]) -> str:
@@ -107,15 +143,33 @@ class AsrEngine:
 
     def __init__(self, vad: VadPipeline) -> None:
         self.vad = vad
-        self.engine_type = os.getenv("FLOW_ASR_ENGINE", "faster_whisper").strip().lower()
-        self.model_name = os.getenv(
-            "FLOW_ASR_MODEL",
-            "facebook/seamless-m4t-v2-large"
-            if self.engine_type == "seamless_m4t_v2"
-            else "distil-large-v3",
+        self.engine_type = (
+            os.getenv("CRISPTYPE_ASR_ENGINE")
+            or os.getenv("FLOW_ASR_ENGINE")
+            or "faster_whisper"
+        ).strip().lower()
+
+        default_model = "distil-large-v3"
+        if self.engine_type == "parakeet":
+            default_model = "nemo-parakeet-tdt-0.6b-v2"
+        elif self.engine_type == "seamless_m4t_v2":
+            default_model = "facebook/seamless-m4t-v2-large"
+
+        self.model_name = (
+            os.getenv("CRISPTYPE_ASR_MODEL")
+            or os.getenv("FLOW_ASR_MODEL")
+            or default_model
         ).strip()
-        self.device = os.getenv("FLOW_ASR_DEVICE", "auto").strip().lower()
-        self.compute_type = os.getenv("FLOW_ASR_COMPUTE_TYPE", "int8").strip()
+        self.device = (
+            os.getenv("CRISPTYPE_ASR_DEVICE")
+            or os.getenv("FLOW_ASR_DEVICE")
+            or "auto"
+        ).strip().lower()
+        self.compute_type = (
+            os.getenv("CRISPTYPE_ASR_COMPUTE_TYPE")
+            or os.getenv("FLOW_ASR_COMPUTE_TYPE")
+            or "int8"
+        ).strip()
         self._cache_lock = threading.Lock()
         self._model_cache: Dict[Tuple[str, str], Tuple[Any, Any, str]] = {}
 
@@ -129,11 +183,17 @@ class AsrEngine:
             return self.engine_type, self.model_name
 
         norm = choice.lower()
+        if "parakeet" in norm:
+            target = choice if ("/" in choice or norm.startswith("nemo-")) else "nemo-parakeet-tdt-0.6b-v2"
+            return "parakeet", target
+
         if norm in ("seamless-m4t-v2", "seamless_m4t_v2") or "seamless" in norm:
             target_name = (
                 choice
                 if "/" in choice
-                else os.getenv("FLOW_SEAMLESS_MODEL", "facebook/seamless-m4t-v2-large")
+                else os.getenv("CRISPTYPE_SEAMLESS_MODEL")
+                or os.getenv("FLOW_SEAMLESS_MODEL")
+                or "facebook/seamless-m4t-v2-large"
             )
             return "seamless_m4t_v2", target_name
 
@@ -151,6 +211,29 @@ class AsrEngine:
         with self._cache_lock:
             if key in self._model_cache:
                 return self._model_cache[key]
+
+            if engine_type == "parakeet":
+                # Prefer lightweight onnx-asr (CPU/GPU ONNX Runtime); fall back to NVIDIA NeMo if installed
+                try:
+                    import onnx_asr  # type: ignore
+
+                    logger.info("Loading NVIDIA Parakeet via onnx-asr (%s)…", model_name)
+                    model = onnx_asr.load_model(model_name)
+                    self._model_cache[key] = (model, "onnx_asr", self.device)
+                    return self._model_cache[key]
+                except ImportError:
+                    import nemo.collections.asr as nemo_asr  # type: ignore
+
+                    nemo_id = (
+                        model_name
+                        if "/" in model_name
+                        else f"nvidia/{model_name.removeprefix('nemo-')}"
+                    )
+                    logger.info("Loading NVIDIA Parakeet via NeMo (%s)…", nemo_id)
+                    model = nemo_asr.models.ASRModel.from_pretrained(model_name=nemo_id)
+                    model.eval()
+                    self._model_cache[key] = (model, "nemo", self.device)
+                    return self._model_cache[key]
 
             if engine_type == "seamless_m4t_v2":
                 import torch  # type: ignore
@@ -212,6 +295,31 @@ class AsrEngine:
         engine_type, model_name = self.resolve_target(model_override)
         model, processor, device = self._get_or_load_model(engine_type, model_name)
         audio_f32 = filtered_pcm.astype(np.float32) / 32768.0
+
+        if engine_type == "parakeet":
+            if processor == "onnx_asr":
+                raw = model.recognize(audio_f32, sample_rate=SAMPLE_RATE)
+                text = (raw if isinstance(raw, str) else " ".join(raw)).strip()
+                return text, language, total_duration_ms
+
+            # NeMo path — uses an ephemeral wav deleted immediately in finally
+            import soundfile as sf  # type: ignore
+
+            tmp_wav: Optional[str] = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp_wav = tmp.name
+                sf.write(tmp_wav, audio_f32, SAMPLE_RATE)
+                hyps = model.transcribe([tmp_wav])
+                first = hyps[0] if hyps else ""
+                text = (getattr(first, "text", first) or "").strip()
+                return text, language, total_duration_ms
+            finally:
+                if tmp_wav and os.path.exists(tmp_wav):
+                    try:
+                        os.remove(tmp_wav)
+                    except OSError:
+                        pass
 
         if engine_type == "seamless_m4t_v2":
             import torch  # type: ignore

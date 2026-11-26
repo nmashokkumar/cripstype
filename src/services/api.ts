@@ -15,7 +15,6 @@ import {
   deriveWebSocketUrl,
 } from '../utils/pcmAudio';
 import {
-  applyLocalCleanupPipeline,
   countStrippedFillersAndCorrections,
   countWords,
 } from '../utils/textPipeline';
@@ -25,8 +24,6 @@ import {
   formatPacketHexPreview,
 } from './diagnostics';
 
-export const LIVE_SEAMLESS_SERVER_URL = 'https://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech';
-
 export const DEFAULT_CLEANUP_CONFIG: AutoCleanupConfig = {
   removeFillerWords: true,
   applySelfCorrections: true,
@@ -34,17 +31,23 @@ export const DEFAULT_CLEANUP_CONFIG: AutoCleanupConfig = {
   autoCapitalization: true,
 };
 
-export const ASR_MODEL_OPTIONS: Array<{ value: AsrModelOption; label: string; hint: string }> = [
-  { value: 'auto', label: 'Server Default (Auto)', hint: 'Uses whichever ASR model the server has loaded' },
-  { value: 'seamless-m4t-v2', label: 'SeamlessM4T v2', hint: 'Meta multilingual speech-to-text' },
-  { value: 'faster-whisper-distil-large-v3', label: 'Faster-Whisper distil-large-v3', hint: 'Low-latency English/multilingual' },
-  { value: 'faster-whisper-large-v3-turbo', label: 'Faster-Whisper large-v3-turbo', hint: 'High accuracy turbo model' },
-];
+/**
+ * Clean provider abstraction supporting self-hosted servers today and
+ * drop-in managed cloud endpoints in future releases without changing UI code.
+ */
+export type BackendProviderMode = 'self_hosted' | 'cloud';
+
+export interface ConnectionProviderConfig {
+  mode: BackendProviderMode;
+  baseUrl: string;
+  apiKey?: string;
+  timeoutMs?: number;
+}
 
 export interface ApiClientConfig {
   baseUrl: string;
   apiKey?: string;
-  mockMode: boolean;
+  mode?: BackendProviderMode;
   timeoutMs?: number;
 }
 
@@ -86,22 +89,30 @@ export interface ProcessedTranscribeResult {
   correctionsAppliedCount: number;
 }
 
-const MOCK_RAW_SAMPLES = [
-  'um so can you send the the report to Sarah by uh Thursday actually no Friday and let her know its nearly done',
-  'uh btw i just tested Flow across my devices and the voice latency feels super crisp today',
-  'hey are you free for lunch tomorrow lets do 12 actually no 12:30 if that works for you',
-  'um basically quick update for the team we finished the Kubernetes dictionary import and uh all tests are passing now',
-  'could you review the pull request before 4 pm and let me know if anything looks off',
-];
-
-let mockSampleIndex = 0;
-
 export function getDefaultServerUrl(): string {
   const envUrl =
-    typeof import.meta !== 'undefined' && import.meta.env?.VITE_FLOW_API_URL
-      ? String(import.meta.env.VITE_FLOW_API_URL).trim()
+    typeof import.meta !== 'undefined'
+      ? String(
+          import.meta.env?.VITE_CRISPTYPE_API_URL || import.meta.env?.VITE_FLOW_API_URL || ''
+        ).trim()
       : '';
-  return (envUrl || LIVE_SEAMLESS_SERVER_URL).replace(/\/+$/, '');
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, '');
+  }
+
+  // Inside Tauri / native desktop webviews, default to local self-hosted backend
+  if (typeof window !== 'undefined') {
+    const isDesktopOrigin =
+      window.location.protocol === 'tauri:' ||
+      window.location.hostname === 'tauri.localhost' ||
+      window.location.protocol === 'capacitor:' ||
+      window.location.protocol === 'file:';
+    if (!isDesktopOrigin && window.location.origin && window.location.origin !== 'null') {
+      return window.location.origin.replace(/\/+$/, '');
+    }
+  }
+
+  return 'http://localhost:8000';
 }
 
 export function normalizeBaseUrl(url: string): string {
@@ -120,6 +131,15 @@ export function serializeDictionaryForApi(dictionary: DictionaryEntry[]) {
       ? { type: 'replacement' as const, trigger: d.trigger, replacement: d.replacement }
       : { type: 'word' as const, trigger: d.trigger }
   );
+}
+
+function buildAuthHeaders(apiKey?: string): Record<string, string> {
+  const trimmed = apiKey?.trim();
+  if (!trimmed) return {};
+  return {
+    'X-API-Key': trimmed,
+    Authorization: `Bearer ${trimmed}`,
+  };
 }
 
 function buildProcessedResult(
@@ -159,95 +179,21 @@ function buildProcessedResult(
 }
 
 /**
- * Generates a realistic offline demo result when Offline Demo Mode is enabled in Settings,
- * applying the user's active Style preset, Auto Cleanup settings, and Dictionary.
- */
-export async function runMockTranscription(
-  dictionary: DictionaryEntry[],
-  options?: {
-    language?: string;
-    style?: StylePreset;
-    context?: StyleContext;
-    cleanup?: AutoCleanupConfig;
-    appContext?: string;
-  }
-): Promise<ProcessedTranscribeResult> {
-  await new Promise((resolve) => setTimeout(resolve, 450));
-  const rawSample = MOCK_RAW_SAMPLES[mockSampleIndex % MOCK_RAW_SAMPLES.length];
-  mockSampleIndex += 1;
-
-  const style = options?.style ?? 'formal';
-  const context = options?.context ?? 'other';
-  const cleanup = options?.cleanup ?? DEFAULT_CLEANUP_CONFIG;
-  const language = options?.language ?? 'en';
-
-  const processed = applyLocalCleanupPipeline(rawSample, {
-    style,
-    context,
-    cleanup,
-    dictionary,
-  });
-
-  const numWords = Math.max(4, countWords(processed.text));
-  const simulatedDurationMs = Math.round((numWords / 168) * 60000);
-  const diff = countStrippedFillersAndCorrections(rawSample, processed.text);
-
-  diagnostics.record({
-    direction: 'info',
-    kind: 'ws_final',
-    endpoint: 'offline-demo://local',
-    durationMs: simulatedDurationMs,
-    summary: `Offline demo transcript (${numWords} words, style=${style})`,
-    detail: processed.text,
-  });
-
-  return {
-    text: processed.text,
-    formatted_text: processed.text,
-    raw_text: rawSample,
-    num_words: numWords,
-    language,
-    duration_ms: simulatedDurationMs,
-    app_context: options?.appContext,
-    category: context,
-    style_applied: style,
-    fillerRemovedCount: Math.max(diff.fillersRemoved, processed.fillerRemovedCount),
-    correctionsAppliedCount: Math.max(diff.correctionsFixed, processed.correctionsAppliedCount),
-  };
-}
-
-/**
  * Verifies backend availability via GET {baseUrl}/health (with fallback to GET {baseUrl}/).
  */
 export async function checkServerHealth(config: ApiClientConfig): Promise<ServerHealthResult> {
   const started = performance.now();
 
-  if (config.mockMode) {
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    return {
-      ok: true,
-      latencyMs: Math.round(performance.now() - started),
-      message: 'Offline demo mode active — local cleanup pipeline ready.',
-      asrEngine: 'Local Demo',
-      vadEngine: 'Browser RMS',
-      llmProvider: 'Deterministic',
-    };
-  }
-
   const baseUrl = normalizeBaseUrl(config.baseUrl);
   if (!baseUrl) {
-    return { ok: false, latencyMs: 0, message: 'Enter a server link to connect.' };
+    return { ok: false, latencyMs: 0, message: 'Enter a server URL to connect.' };
   }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.timeoutMs ?? 8000);
 
   try {
-    const headers: Record<string, string> = {};
-    if (config.apiKey?.trim()) {
-      headers['X-API-Key'] = config.apiKey.trim();
-      headers['Authorization'] = `Bearer ${config.apiKey.trim()}`;
-    }
+    const headers = buildAuthHeaders(config.apiKey);
 
     let res = await fetch(`${baseUrl}/health`, {
       method: 'GET',
@@ -268,7 +214,9 @@ export async function checkServerHealth(config: ApiClientConfig): Promise<Server
       const msg =
         res.status === 401 || res.status === 403
           ? 'Server rejected the API key. Check your key and try again.'
-          : `Server returned HTTP ${res.status} (${res.statusText || 'Error'}).`;
+          : res.status === 429
+            ? 'Rate limit reached. Wait a moment and try again.'
+            : `Server returned HTTP ${res.status} (${res.statusText || 'Error'}).`;
       diagnostics.record({
         direction: 'in',
         kind: 'error',
@@ -329,8 +277,8 @@ export async function checkServerHealth(config: ApiClientConfig): Promise<Server
     const latencyMs = Math.round(performance.now() - started);
     const msg =
       err instanceof DOMException && err.name === 'AbortError'
-        ? `Connection timed out after ${Math.round((config.timeoutMs ?? 8000) / 1000)}s. Ensure your server VM is awake.`
-        : 'Unable to reach server. Verify the URL is running and HTTPS/CORS is enabled.';
+        ? `Connection timed out after ${Math.round((config.timeoutMs ?? 8000) / 1000)}s. Ensure your server is running.`
+        : 'Unable to reach server. Verify the URL is running and HTTPS/CORS is configured.';
     diagnostics.record({
       direction: 'in',
       kind: 'error',
@@ -346,11 +294,11 @@ export async function checkServerHealth(config: ApiClientConfig): Promise<Server
 }
 
 /**
- * Live streaming WebSocket client for SeamlessM4T v2 / Faster-Whisper + C++ Silero VAD + Layer 2 LLM:
- * 1. Connects to wss://{host}/api/v1/meetings/transcribe
- * 2. Sends JSON handshake with model, auto-detected app_context, app_category, preset, style_map, cleanup, dictionary
- * 3. Streams 1,024-byte (512-sample = 32ms) 16kHz 16-bit PCM binary ArrayBuffer frames
- * 4. Sends { type: "stop" } and resolves with the server's final JSON payload
+ * Live streaming WebSocket client for Silero VAD + NVIDIA Parakeet / Faster-Whisper + Llama 3.2:
+ * 1. Connects to wss://{host}/api/v1/meetings/transcribe (no API key in URL query logs)
+ * 2. Sends JSON `start` handshake carrying optional `api_key`, app context, style preset, cleanup & dictionary
+ * 3. Streams 1,024-byte (512-sample = 32ms) 16 kHz Int16 PCM binary ArrayBuffer frames
+ * 4. Sends `{ type: "stop" }` and resolves with the server's final formatted JSON payload
  */
 export class StreamingDictationSession {
   private ws: WebSocket | null = null;
@@ -372,6 +320,7 @@ export class StreamingDictationSession {
   private readonly displayUrl: string;
   private readonly handshakePayload: {
     type: 'start';
+    api_key?: string;
     model?: string;
     preset: StylePreset;
     app_context: string;
@@ -394,15 +343,13 @@ export class StreamingDictationSession {
   }) {
     const url = deriveWebSocketUrl(options.baseUrl);
     this.displayUrl = url;
-    if (options.apiKey?.trim()) {
-      const sep = url.includes('?') ? '&' : '?';
-      this.wsUrl = `${url}${sep}api_key=${encodeURIComponent(options.apiKey.trim())}`;
-    } else {
-      this.wsUrl = url;
-    }
+    // Never append API keys to URL query strings where proxies or server access logs record them.
+    this.wsUrl = url;
 
+    const trimmedKey = options.apiKey?.trim();
     this.handshakePayload = {
       type: 'start',
+      api_key: trimmedKey || undefined,
       model: options.model && options.model !== 'auto' ? options.model : undefined,
       preset: options.preset,
       app_context: options.appContext,
@@ -428,7 +375,7 @@ export class StreamingDictationSession {
       kind: 'ws_connect',
       endpoint: this.displayUrl,
       summary: 'Opening WebSocket audio stream',
-      detail: `model=${this.handshakePayload.model ?? 'auto'} · app=${this.handshakePayload.app_context} · style=${this.handshakePayload.preset}`,
+      detail: `app=${this.handshakePayload.app_context} · style=${this.handshakePayload.preset}`,
     });
 
     const ws = new WebSocket(this.wsUrl);
@@ -450,7 +397,7 @@ export class StreamingDictationSession {
         endpoint: this.displayUrl,
         bytes: startJson.length,
         summary: 'Sent JSON handshake { type: "start" }',
-        detail: `app=${this.handshakePayload.app_context} (${this.handshakePayload.app_category}), preset=${this.handshakePayload.preset}, model=${this.handshakePayload.model ?? 'auto'}, dict=${this.handshakePayload.dictionary.length}`,
+        detail: `app=${this.handshakePayload.app_context} (${this.handshakePayload.app_category}), preset=${this.handshakePayload.preset}, dict=${this.handshakePayload.dictionary.length}`,
       });
 
       for (const packet of this.pendingPackets) {
@@ -520,7 +467,8 @@ export class StreamingDictationSession {
                 ? `, server ack ${msg.packets_received} pkts / ${msg.pcm_bytes_received ?? 0} B`
                 : ''
             })`,
-            detail: result.formatted_text || '(empty speech)',
+            // Keep diagnostics privacy-first: log metadata, never raw spoken transcript text
+            detail: `words=${result.num_words} · style=${result.style_applied ?? this.handshakePayload.preset} · lang=${result.language}`,
           });
           this.resolveFinal(result);
         }
@@ -693,8 +641,6 @@ export class StreamingDictationSession {
 
 /**
  * Runs a real synthetic 32ms-packet WebSocket connectivity verification against the given baseUrl.
- * Sends the JSON `start` handshake, five 1,024-byte (512-sample = 32ms) Int16 PCM packets, and `stop`,
- * verifying end-to-end packet splitting, binary transmission, and backend acknowledgment.
  */
 export async function runLiveStreamDiagnosticTest(options: {
   baseUrl: string;
@@ -727,7 +673,6 @@ export async function runLiveStreamDiagnosticTest(options: {
   try {
     session.connect();
 
-    // Generate 160ms (5 x 32ms = 2,560 samples) of low-amplitude 440 Hz PCM and split with PcmPacketizer
     const samples = new Int16Array(PCM_PACKET_SAMPLES * 5);
     for (let i = 0; i < samples.length; i += 1) {
       samples[i] = Math.round(Math.sin((2 * Math.PI * 440 * i) / TARGET_SAMPLE_RATE) * 800);
@@ -780,16 +725,6 @@ export async function batchTranscribeAudio(
 ): Promise<ProcessedTranscribeResult> {
   const language = payload.language ?? 'en';
 
-  if (config.mockMode) {
-    return runMockTranscription(payload.dictionary, {
-      language,
-      style: payload.style,
-      context: payload.context,
-      cleanup: payload.cleanup,
-      appContext: payload.appContext,
-    });
-  }
-
   const baseUrl = normalizeBaseUrl(config.baseUrl);
   if (!baseUrl) {
     throw new Error('Server URL is not configured. Open Settings to paste your server link.');
@@ -809,11 +744,7 @@ export async function batchTranscribeAudio(
   formData.append('dictionary', JSON.stringify(serializeDictionaryForApi(payload.dictionary)));
   formData.append('language', language);
 
-  const headers: Record<string, string> = {};
-  if (config.apiKey?.trim()) {
-    headers['X-API-Key'] = config.apiKey.trim();
-    headers['Authorization'] = `Bearer ${config.apiKey.trim()}`;
-  }
+  const headers = buildAuthHeaders(config.apiKey);
 
   const endpoint = `${baseUrl}/transcribe`;
   diagnostics.record({
@@ -822,7 +753,7 @@ export async function batchTranscribeAudio(
     endpoint,
     bytes: payload.audio.size,
     summary: `POST /transcribe (${payload.audio.size.toLocaleString()} B)`,
-    detail: `style=${payload.style || 'formal'} · app=${payload.appContext || 'unknown'} · model=${payload.model || 'auto'}`,
+    detail: `style=${payload.style || 'formal'} · app=${payload.appContext || 'General'}`,
   });
 
   const controller = new AbortController();
@@ -840,10 +771,13 @@ export async function batchTranscribeAudio(
 
     const elapsedMs = Math.round(performance.now() - started);
     if (!response.ok) {
-      const errorBody = await response.text().catch(() => '');
-      throw new Error(
-        `Server error (${response.status}): ${errorBody.slice(0, 140) || response.statusText}`
-      );
+      const errorMsg =
+        response.status === 401 || response.status === 403
+          ? 'Unauthorized: check your API key in Settings.'
+          : response.status === 429
+            ? 'Rate limit exceeded. Wait a moment and try again.'
+            : `Server returned HTTP ${response.status} (${response.statusText || 'Error'}).`;
+      throw new Error(errorMsg);
     }
 
     const data = (await response.json()) as Partial<TranscribeResponse>;
@@ -854,7 +788,7 @@ export async function batchTranscribeAudio(
       endpoint,
       durationMs: elapsedMs,
       summary: `Batch response (${processed.num_words} words in ${elapsedMs} ms)`,
-      detail: processed.formatted_text,
+      detail: `words=${processed.num_words} · lang=${processed.language}`,
     });
     return processed;
   } catch (err) {

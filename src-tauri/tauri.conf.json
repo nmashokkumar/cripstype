@@ -45,7 +45,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "targets": ["deb", "appimage", "nsis"],
     "icon": [
       "icons/icon.png"
     ],
@@ -56,7 +56,16 @@
           "libayatana-appindicator3-1",
           "xclip",
           "xdotool"
+        ],
+        "recommends": [
+          "wl-clipboard",
+          "wtype"
         ]
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
       }
     }
   }

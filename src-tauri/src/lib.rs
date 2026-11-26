@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -66,8 +67,8 @@ fn to_tauri_shortcut(binding: &HotkeyBindingPayload) -> Option<String> {
         code if code.starts_with("Key") && code.len() == 4 => &code[3..],
         code if code.starts_with("Digit") && code.len() == 6 => &code[5..],
         code if code.starts_with('F') && code.len() <= 3 => code,
-        // Pure modifier-only keys (e.g. Right Ctrl / fn) cannot be registered directly via X11/Wayland
-        // global-shortcut without an accompanying key; skip gracefully so hands-free combo still works.
+        // Pure modifier-only keys cannot be registered directly via OS global-shortcut APIs;
+        // skip gracefully so hands-free combo remains active.
         _ => return None,
     };
 
@@ -77,6 +78,25 @@ fn to_tauri_shortcut(binding: &HotkeyBindingPayload) -> Option<String> {
     } else {
         Some(parts.join("+"))
     }
+}
+
+/// Helper that pipes UTF-8 text into a child process's stdin directly (never via a shell
+/// and never as a CLI argument that could appear in process listings).
+fn pipe_text_to_command(program: &str, args: &[&str], text: &str) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            child.wait()
+        })
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Positions the floating transparent overlay at bottom-center of the active monitor.
@@ -184,7 +204,8 @@ fn update_hotkeys(
 fn get_active_app() -> Option<ActiveAppInfo> {
     #[cfg(target_os = "linux")]
     {
-        // Best-effort X11 active window title detection via xdotool (fails gracefully on Wayland)
+        // Best-effort X11 active window detection via xdotool (gracefully returns None on Wayland
+        // where compositors restrict window inspection; frontend falls back cleanly to "General").
         let title = Command::new("xdotool")
             .args(["getactivewindow", "getwindowname"])
             .output()
@@ -211,63 +232,132 @@ fn get_active_app() -> Option<ActiveAppInfo> {
         None
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Static Win32 foreground window query (zero user data interpolated)
+        const PS_ACTIVE_WINDOW: &str = r#"
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinFocus {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+}
+"@
+$h = [WinFocus]::GetForegroundWindow()
+if ($h -eq [IntPtr]::Zero) { exit 1 }
+$sb = New-Object System.Text.StringBuilder 512
+[void][WinFocus]::GetWindowText($h, $sb, 512)
+$pidOut = 0
+[void][WinFocus]::GetWindowThreadProcessId($h, [ref]$pidOut)
+$proc = (Get-Process -Id $pidOut -ErrorAction SilentlyContinue).ProcessName
+Write-Output "$proc|$($sb.ToString())"
+"#;
+
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PS_ACTIVE_WINDOW])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let (app_name, window_title) = raw
+            .split_once('|')
+            .map(|(a, t)| (a.trim().to_string(), t.trim().to_string()))
+            .unwrap_or((raw, String::new()));
+
+        if !app_name.is_empty() || !window_title.is_empty() {
+            return Some(ActiveAppInfo {
+                app_name,
+                window_title,
+                platform: "windows",
+            });
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         None
     }
 }
 
 #[tauri::command]
-fn paste_text(text: String) -> bool {
+fn copy_text(text: String) -> bool {
     #[cfg(target_os = "linux")]
     {
-        // 1. Copy to clipboard via wl-copy (Wayland) or xclip (X11)
         let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-        let copied = if is_wayland {
-            Command::new("wl-copy")
-                .arg(&text)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        } else {
-            Command::new("sh")
-                .args(["-c", "xclip -selection clipboard"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut child| {
-                    use std::io::Write;
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(text.as_bytes());
-                    }
-                    child.wait()
-                })
-                .map(|s| s.success())
-                .unwrap_or(false)
-        };
-
-        if !copied {
-            return false;
+        if is_wayland && pipe_text_to_command("wl-copy", &[], &text) {
+            return true;
         }
-
-        // 2. Simulate Ctrl+V into the currently focused external window
-        if is_wayland {
-            Command::new("wtype")
-                .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        } else {
-            Command::new("xdotool")
-                .args(["key", "--clearmodifiers", "ctrl+v"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
+        pipe_text_to_command("xclip", &["-selection", "clipboard"], &text)
+            || pipe_text_to_command("xsel", &["--clipboard", "--input"], &text)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Pipe directly to clip.exe via stdin (no shell escaping needed)
+        pipe_text_to_command("clip.exe", &[], &text)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = text;
+        false
+    }
+}
+
+#[tauri::command]
+fn paste_text(text: String) -> bool {
+    if !copy_text(text) {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if is_wayland {
+            return Command::new("wtype")
+                .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        }
+
+        Command::new("xdotool")
+            .args(["key", "--clearmodifiers", "ctrl+v"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Send Ctrl+V safely using a static command (text is already on the clipboard via clip.exe)
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "$wshell = New-Object -ComObject WScript.Shell; $wshell.SendKeys('^v')",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
         false
     }
 }
@@ -320,6 +410,7 @@ pub fn run() {
             get_autostart,
             update_hotkeys,
             get_active_app,
+            copy_text,
             paste_text,
         ])
         .setup(move |app| {

@@ -1,16 +1,16 @@
 services:
-  flow-server:
+  crisptype-server:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: flow-dictation-server
+    container_name: crisptype-dictation-server
     restart: unless-stopped
     ports:
       - "${PORT:-8000}:8000"
     env_file:
       - .env
     volumes:
-      - flow-model-cache:/root/.cache/huggingface
+      - crisptype-model-cache:/home/crisptype/.cache/huggingface
 
 volumes:
-  flow-model-cache:
+  crisptype-model-cache:

@@ -15,9 +15,14 @@ from typing import Any, List, Mapping, Optional
 
 import httpx
 
-from .app_classifier import AppStyleDecision, build_layer2_system_prompt
+from .app_classifier import (
+    AppStyleDecision,
+    build_layer2_system_prompt,
+    strip_transcript_delimiters,
+    wrap_untrusted_transcript,
+)
 
-logger = logging.getLogger("flow.llm")
+logger = logging.getLogger("crisptype.llm")
 
 FILLER_REGEX = re.compile(
     r"\b(?:um+|uh+|er+|ah+|hmm+|you know|i mean|sort of|kind of|basically)\b,?\s*",
@@ -108,10 +113,18 @@ class Layer2Refiner:
     """Async Layer 2 LLM polisher with automatic deterministic fallback."""
 
     def __init__(self) -> None:
-        self.base_url = os.getenv("FLOW_LLM_URL", "").strip().rstrip("/")
-        self.api_key = os.getenv("FLOW_LLM_API_KEY", "").strip()
-        self.model = os.getenv("FLOW_LLM_MODEL", "llama3.2:3b").strip()
-        self.timeout_sec = float(os.getenv("FLOW_LLM_TIMEOUT_SEC", "15"))
+        self.base_url = (
+            os.getenv("CRISPTYPE_LLM_URL") or os.getenv("FLOW_LLM_URL") or ""
+        ).strip().rstrip("/")
+        self.api_key = (
+            os.getenv("CRISPTYPE_LLM_API_KEY") or os.getenv("FLOW_LLM_API_KEY") or ""
+        ).strip()
+        self.model = (
+            os.getenv("CRISPTYPE_LLM_MODEL") or os.getenv("FLOW_LLM_MODEL") or "llama3.2:3b"
+        ).strip()
+        self.timeout_sec = float(
+            os.getenv("CRISPTYPE_LLM_TIMEOUT_SEC") or os.getenv("FLOW_LLM_TIMEOUT_SEC") or "15"
+        )
 
     @property
     def provider_label(self) -> str:
@@ -156,7 +169,7 @@ class Layer2Refiner:
             "temperature": 0.1,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": raw_text},
+                {"role": "user", "content": wrap_untrusted_transcript(raw_text)},
             ],
         }
 
@@ -165,15 +178,20 @@ class Layer2Refiner:
                 resp = await client.post(self._endpoint_url(), headers=headers, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                polished = (
+                raw_polished = (
                     data.get("choices", [{}])[0]
                     .get("message", {})
                     .get("content", "")
                     .strip()
                 )
+                polished = strip_transcript_delimiters(raw_polished) if raw_polished else ""
                 if polished and not is_duplicated_output(raw_text, polished):
                     return apply_dictionary_rules(polished, dictionary)
         except Exception as exc:
-            logger.warning("Layer 2 LLM failed (%s); falling back to deterministic cleaner.", exc)
+            # Never log raw or formatted user transcripts
+            logger.warning(
+                "Layer 2 LLM unavailable (%s); falling back to deterministic cleaner.",
+                type(exc).__name__,
+            )
 
         return deterministic_fallback_polish(raw_text, decision, cleanup, dictionary)

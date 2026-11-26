@@ -242,8 +242,8 @@ export function encodePcm16ToWavBlob(
 /**
  * Derives the streaming transcription WebSocket URL from any Base HTTPS/HTTP API URL.
  * Example:
- *   https://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech
- *   -> wss://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech/api/v1/meetings/transcribe
+ *   https://dictate.example.com
+ *   -> wss://dictate.example.com/api/v1/meetings/transcribe
  */
 export function deriveWebSocketUrl(baseUrl: string): string {
   const trimmed = baseUrl

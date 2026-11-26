@@ -95,7 +95,7 @@ class CrossPlatformBridge implements PlatformBridge {
         }
       }
 
-      // Web fallback: infer context from document title if recognizable, else "Browser"
+      // Web fallback: infer context from document title if recognizable, else "General"
       const title = document.title?.trim() ?? '';
       if (title && !/^(flow|crisptype)\b/i.test(title)) {
         const classified = classifyAppContext('', title);
@@ -103,10 +103,10 @@ class CrossPlatformBridge implements PlatformBridge {
           return classified;
         }
       }
-      return { appName: 'Browser', category: 'other' };
+      return { appName: this.isNativeHost ? 'General' : 'Browser', category: 'other' };
     }
 
-    return { appName: 'Desktop', category: 'other' };
+    return { appName: 'General', category: 'other' };
   }
 
   async insertText(text: string): Promise<boolean> {
@@ -120,11 +120,11 @@ class CrossPlatformBridge implements PlatformBridge {
           const pasted = await tauriInvoke<boolean>('paste_text', { text });
           if (pasted) return true;
         } catch {
-          // Fall through to clipboard / test sink
+          // Fall through cleanly to clipboard / test sink
         }
       }
 
-      // 2. Electron / Capacitor bridge
+      // 2. Native mobile / custom bridge
       const nativePaste = window.flowNative?.pasteText ?? window.electronAPI?.pasteText;
       if (typeof nativePaste === 'function') {
         try {
@@ -148,12 +148,24 @@ class CrossPlatformBridge implements PlatformBridge {
   async copyToClipboard(text: string): Promise<boolean> {
     if (!text) return false;
 
-    if (typeof window !== 'undefined' && typeof window.flowNative?.copyText === 'function') {
-      try {
-        const copied = await window.flowNative.copyText(text);
-        if (copied) return true;
-      } catch {
-        // Fall through to Web Clipboard API
+    if (typeof window !== 'undefined') {
+      const tauriInvoke = getTauriInvoke();
+      if (tauriInvoke) {
+        try {
+          const copied = await tauriInvoke<boolean>('copy_text', { text });
+          if (copied) return true;
+        } catch {
+          // Fall through to Web Clipboard API
+        }
+      }
+
+      if (typeof window.flowNative?.copyText === 'function') {
+        try {
+          const copied = await window.flowNative.copyText(text);
+          if (copied) return true;
+        } catch {
+          // Fall through to Web Clipboard API
+        }
       }
     }
 

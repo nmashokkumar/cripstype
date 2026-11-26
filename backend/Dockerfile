@@ -39,9 +39,16 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
 
+# 4. Run as non-root user for container security
+RUN useradd --create-home --shell /usr/sbin/nologin crisptype && \
+    chown -R crisptype:crisptype /app
+
+USER crisptype
+
 ENV LD_LIBRARY_PATH="/opt/onnxruntime/lib:${LD_LIBRARY_PATH}" \
     SILERO_VAD_LIB_PATH="/app/native/build/libsilero_vad.so" \
-    SILERO_VAD_MODEL_PATH="/app/models/silero_vad.onnx"
+    SILERO_VAD_MODEL_PATH="/app/models/silero_vad.onnx" \
+    HF_HOME="/home/crisptype/.cache/huggingface"
 
 EXPOSE 8000
 

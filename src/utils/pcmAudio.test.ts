@@ -84,12 +84,12 @@ describe('pcmAudio — resampling & 1,024-byte packetization', () => {
 describe('pcmAudio — WebSocket URL derivation & timer formatting', () => {
   it('derives wss://.../api/v1/meetings/transcribe from HTTPS base URL', () => {
     assert.equal(
-      deriveWebSocketUrl('https://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech'),
-      'wss://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech/api/v1/meetings/transcribe'
+      deriveWebSocketUrl('https://dictate.example.com'),
+      'wss://dictate.example.com/api/v1/meetings/transcribe'
     );
     assert.equal(
-      deriveWebSocketUrl('https://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech/transcribe/'),
-      'wss://8000-agq75oq6i7eazd5pahfhehvvj4.instabox.tech/api/v1/meetings/transcribe'
+      deriveWebSocketUrl('https://dictate.example.com/transcribe/'),
+      'wss://dictate.example.com/api/v1/meetings/transcribe'
     );
     assert.equal(
       deriveWebSocketUrl('http://localhost:8000'),

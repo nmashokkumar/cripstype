@@ -9,12 +9,13 @@ import ctypes
 import logging
 import os
 import platform
+import threading
 from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 
-logger = logging.getLogger("flow.vad")
+logger = logging.getLogger("crisptype.vad")
 
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 512
@@ -55,6 +56,7 @@ class NativeSileroVad:
         self._lib.silero_vad_destroy.argtypes = [ctypes.c_void_p]
         self._lib.silero_vad_destroy.restype = None
 
+        self._lock = threading.Lock()
         self._handle = self._lib.silero_vad_create(str(model_path).encode("utf-8"), SAMPLE_RATE)
         if not self._handle:
             raise RuntimeError(f"Failed to initialize C++ Silero VAD from {model_path}")
@@ -68,15 +70,20 @@ class NativeSileroVad:
         out_buf = np.empty_like(contiguous)
         out_samples = ctypes.c_size_t(0)
 
-        status = self._lib.silero_vad_filter_pcm(
-            self._handle,
-            contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
-            contiguous.size,
-            ctypes.c_float(threshold),
-            ctypes.c_int(pad_ms),
-            out_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
-            ctypes.byref(out_samples),
-        )
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError("C++ Silero VAD handle has already been closed")
+            # Reset LSTM hidden state between independent utterances/requests
+            self._lib.silero_vad_reset(self._handle)
+            status = self._lib.silero_vad_filter_pcm(
+                self._handle,
+                contiguous.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                contiguous.size,
+                ctypes.c_float(threshold),
+                ctypes.c_int(pad_ms),
+                out_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                ctypes.byref(out_samples),
+            )
         if status == 1 and out_samples.value > 0:
             return out_buf[: out_samples.value].copy(), True
         if status == 0:
@@ -84,7 +91,13 @@ class NativeSileroVad:
         raise RuntimeError("C++ Silero VAD returned an error status during filtering")
 
     def close(self) -> None:
-        if getattr(self, "_handle", None):
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                if getattr(self, "_handle", None):
+                    self._lib.silero_vad_destroy(self._handle)
+                    self._handle = None
+        elif getattr(self, "_handle", None):
             self._lib.silero_vad_destroy(self._handle)
             self._handle = None
 
@@ -210,7 +223,7 @@ class VadPipeline:
             except Exception as exc:
                 logger.warning("Python ONNX Silero VAD unavailable (%s); using RMS fallback.", exc)
 
-        logger.info("Using lightweight RMS energy VAD fallback (run install.sh for C++ Silero VAD).")
+        logger.info("Using lightweight RMS energy VAD fallback (run setup.sh for C++ Silero VAD).")
 
     def extract_speech(self, pcm16: np.ndarray, threshold: float = 0.45) -> Tuple[np.ndarray, bool]:
         return self._impl.filter_pcm(pcm16, threshold=threshold)
