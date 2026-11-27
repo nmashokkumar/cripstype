@@ -154,6 +154,11 @@ const APP_CLASSIFICATION_RULES: AppRule[] = [
   },
   {
     category: 'work',
+    canonicalName: 'Antigravity',
+    patterns: [/\bantigravity\b/i],
+  },
+  {
+    category: 'work',
     canonicalName: 'Cursor',
     patterns: [/\bcursor\b/i],
   },
@@ -171,6 +176,21 @@ const APP_CLASSIFICATION_RULES: AppRule[] = [
     category: 'work',
     canonicalName: 'Figma',
     patterns: [/\bfigma\b/i],
+  },
+  {
+    category: 'other',
+    canonicalName: 'Brave Browser',
+    patterns: [/\bbrave\b/i],
+  },
+  {
+    category: 'other',
+    canonicalName: 'Chrome',
+    patterns: [/\bgoogle\s*chrome\b/i, /\bchrome\b/i],
+  },
+  {
+    category: 'other',
+    canonicalName: 'Firefox',
+    patterns: [/\bfirefox\b/i],
   },
 ];
 

@@ -120,8 +120,23 @@ export function DictationPage() {
     }
     stopPlayback();
 
-    if (entry.audioBlob && entry.audioBlob.size > 32) {
-      const url = URL.createObjectURL(entry.audioBlob);
+    let playableBlob: Blob | null =
+      entry.audioBlob && entry.audioBlob.size > 32 ? entry.audioBlob : null;
+    if (!playableBlob && entry.audioBase64) {
+      try {
+        const binary = atob(entry.audioBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        playableBlob = new Blob([bytes], { type: entry.audioMimeType || 'audio/wav' });
+      } catch {
+        playableBlob = null;
+      }
+    }
+
+    if (playableBlob && playableBlob.size > 32) {
+      const url = URL.createObjectURL(playableBlob);
       audioUrlRef.current = url;
       const audio = new Audio(url);
       audioRef.current = audio;

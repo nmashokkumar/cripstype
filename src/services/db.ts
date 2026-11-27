@@ -19,6 +19,7 @@ const DB_VERSION = 2;
 const HISTORY_SEED_FLAG_KEY = 'flow_history_seeded_v1';
 const DICT_SEED_FLAG_KEY = 'flow_dictionary_idb_migrated_v1';
 const LEGACY_DICT_STORAGE_KEY = 'flow_dictionary_v1';
+export const MAX_HISTORY_ENTRIES = 15;
 
 let dbPromise: Promise<IDBPDatabase<FlowDBSchema>> | null = null;
 
@@ -196,12 +197,30 @@ function createInitialSeedEntries(): HistoryEntry[] {
   ];
 }
 
+async function pruneHistoryToLimit(
+  db: IDBPDatabase<FlowDBSchema>,
+  limit: number = MAX_HISTORY_ENTRIES
+): Promise<HistoryEntry[]> {
+  const existing = await db.getAllFromIndex('history', 'by-timestamp');
+  const sorted = existing.sort((a, b) => b.timestamp - a.timestamp);
+  if (sorted.length > limit) {
+    const toDelete = sorted.slice(limit);
+    const tx = db.transaction('history', 'readwrite');
+    for (const item of toDelete) {
+      await tx.store.delete(item.id);
+    }
+    await tx.done;
+    return sorted.slice(0, limit);
+  }
+  return sorted;
+}
+
 export async function loadAllHistory(): Promise<HistoryEntry[]> {
   const db = await getDb();
   const existing = await db.getAllFromIndex('history', 'by-timestamp');
 
   if (existing.length === 0 && typeof window !== 'undefined' && !window.localStorage.getItem(HISTORY_SEED_FLAG_KEY)) {
-    const seeds = createInitialSeedEntries();
+    const seeds = createInitialSeedEntries().slice(0, MAX_HISTORY_ENTRIES);
     const tx = db.transaction('history', 'readwrite');
     for (const item of seeds) {
       await tx.store.put(item);
@@ -211,7 +230,7 @@ export async function loadAllHistory(): Promise<HistoryEntry[]> {
     return seeds.sort((a, b) => b.timestamp - a.timestamp);
   }
 
-  return existing.sort((a, b) => b.timestamp - a.timestamp);
+  return pruneHistoryToLimit(db, MAX_HISTORY_ENTRIES);
 }
 
 export async function getHistoryEntryById(id: string): Promise<HistoryEntry | undefined> {
@@ -222,6 +241,7 @@ export async function getHistoryEntryById(id: string): Promise<HistoryEntry | un
 export async function saveHistoryEntry(entry: HistoryEntry): Promise<void> {
   const db = await getDb();
   await db.put('history', entry);
+  await pruneHistoryToLimit(db, MAX_HISTORY_ENTRIES);
 }
 
 export async function deleteHistoryEntry(id: string): Promise<void> {

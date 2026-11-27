@@ -41,6 +41,8 @@ export interface HistoryEntry {
   text: string;
   rawText: string;
   audioBlob?: Blob | null;
+  audioBase64?: string;
+  audioMimeType?: string;
   numWords?: number;
   durationMs: number;
   timestamp: number;

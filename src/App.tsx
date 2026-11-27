@@ -69,6 +69,13 @@ export default function App() {
       void platform.setMinimizeToTray(settings.minimizeToTray);
       void platform.setAutoStart(settings.launchAtStartup);
     }
+    const onFocus = () => {
+      if (!isOverlayPathname()) {
+        void initHistory();
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initHistory, initDictionary]);
 

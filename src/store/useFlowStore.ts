@@ -15,6 +15,7 @@ import type {
 } from '../types';
 import {
   DEFAULT_DICTIONARY_ENTRIES,
+  MAX_HISTORY_ENTRIES,
   bulkSaveDictionaryEntriesDb,
   clearAllHistory,
   deleteDictionaryEntryDb,
@@ -389,9 +390,9 @@ export const useFlowStore = create<FlowState>((set, get) => {
             ? (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
             : undefined;
         if (typeof tauriInvoke === 'function') {
-          void tauriInvoke('save_persisted_config', { json: JSON.stringify(next) }).catch(
-            () => undefined
-          );
+          void tauriInvoke('save_persisted_config', {
+            json: JSON.stringify({ ...next, stylesByContext: state.stylesByContext }),
+          }).catch(() => undefined);
         }
         if (
           partial.micDeviceId !== undefined &&
@@ -437,6 +438,15 @@ export const useFlowStore = create<FlowState>((set, get) => {
       set((state) => {
         const next = { ...state.stylesByContext, [context]: preset };
         writeJson(STYLES_KEY, next);
+        const tauriInvoke =
+          typeof window !== 'undefined'
+            ? (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+            : undefined;
+        if (typeof tauriInvoke === 'function') {
+          void tauriInvoke('save_persisted_config', {
+            json: JSON.stringify({ ...state.settings, stylesByContext: next }),
+          }).catch(() => undefined);
+        }
         return { stylesByContext: next };
       }),
 
@@ -588,6 +598,37 @@ export const useFlowStore = create<FlowState>((set, get) => {
 
     initHistory: async () => {
       try {
+        const tauriInvoke =
+          typeof window !== 'undefined'
+            ? (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+            : undefined;
+        if (typeof tauriInvoke === 'function') {
+          try {
+            const pendingLines = await tauriInvoke<string[]>('consume_pending_history');
+            for (const line of pendingLines) {
+              const parsed = JSON.parse(line) as HistoryEntry;
+              if (parsed && parsed.id && parsed.text) {
+                let audioBlob: Blob | null = parsed.audioBlob ?? null;
+                const audioMimeType = parsed.audioMimeType || (parsed.audioBase64 ? 'audio/wav' : undefined);
+                if (typeof parsed.audioBase64 === 'string' && parsed.audioBase64.length > 0) {
+                  const binary = atob(parsed.audioBase64);
+                  const bytes = new Uint8Array(binary.length);
+                  for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                  }
+                  audioBlob = new Blob([bytes], { type: audioMimeType || 'audio/wav' });
+                }
+                await saveHistoryEntry({
+                  ...parsed,
+                  audioBlob,
+                  audioMimeType,
+                });
+              }
+            }
+          } catch {
+            // Ignore malformed pending history lines
+          }
+        }
         const items = await loadAllHistory();
         set({ history: items, historyLoaded: true });
       } catch {
@@ -625,14 +666,27 @@ export const useFlowStore = create<FlowState>((set, get) => {
       set({ retranscribingId: id });
       try {
         let updated: HistoryEntry;
+        let audioForRetranscribe: Blob | null =
+          storedEntry.audioBlob && storedEntry.audioBlob.size > 32 ? storedEntry.audioBlob : null;
+        if (!audioForRetranscribe && storedEntry.audioBase64) {
+          try {
+            const binary = atob(storedEntry.audioBase64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            audioForRetranscribe = new Blob([bytes], {
+              type: storedEntry.audioMimeType || 'audio/wav',
+            });
+          } catch {
+            audioForRetranscribe = null;
+          }
+        }
 
-        if (storedEntry.audioBlob && storedEntry.audioBlob.size > 32) {
-          set({ overlayState: 'transcribing', activeStage: 'polish', overlayError: null });
-          broadcastOverlay();
-
+        if (audioForRetranscribe && audioForRetranscribe.size > 32) {
           const result = await batchTranscribeAudio(
             {
-              audio: storedEntry.audioBlob,
+              audio: audioForRetranscribe,
               model: state.settings.asrModel,
               style: preset,
               context,
@@ -640,7 +694,9 @@ export const useFlowStore = create<FlowState>((set, get) => {
               cleanup: state.cleanupConfig,
               dictionary: state.dictionary,
               language: storedEntry.language || 'en',
-              filename: 'retranscribe.webm',
+              filename: audioForRetranscribe.type.includes('wav')
+                ? 'retranscribe.wav'
+                : 'retranscribe.webm',
             },
             {
               baseUrl: state.settings.serverUrl,
@@ -650,6 +706,7 @@ export const useFlowStore = create<FlowState>((set, get) => {
 
           updated = {
             ...storedEntry,
+            audioBlob: audioForRetranscribe,
             text: result.formatted_text,
             rawText: result.raw_text,
             numWords: result.num_words,
@@ -660,8 +717,6 @@ export const useFlowStore = create<FlowState>((set, get) => {
             correctionsAppliedCount: result.correctionsAppliedCount,
           };
 
-          set({ overlayState: 'idle' });
-          broadcastOverlay();
           get().pushToast('Re-transcribed with current Style & Dictionary', 'success');
         } else {
           const reprocessed = applyLocalCleanupPipeline(storedEntry.rawText || storedEntry.text, {
@@ -696,15 +751,8 @@ export const useFlowStore = create<FlowState>((set, get) => {
         }));
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Re-transcription failed';
-        set({ overlayState: 'error', overlayError: message, retranscribingId: null });
-        broadcastOverlay();
+        set({ retranscribingId: null });
         get().pushToast(message, 'error');
-        errorResetTimer = setTimeout(() => {
-          if (get().overlayState === 'error') {
-            set({ overlayState: 'idle', overlayError: null });
-            broadcastOverlay();
-          }
-        }, 5000);
       }
     },
 
@@ -937,11 +985,29 @@ export const useFlowStore = create<FlowState>((set, get) => {
         const resolvedCategory = result.category ?? detectedApp.category;
         const resolvedAppName = result.app_context || detectedApp.appName;
 
+        let audioBase64: string | undefined;
+        let audioMimeType: string | undefined;
+        if (!recording.simulated && recording.blob && recording.blob.size > 32) {
+          try {
+            const buf = new Uint8Array(await recording.blob.arrayBuffer());
+            let bin = '';
+            for (let i = 0; i < buf.length; i++) {
+              bin += String.fromCharCode(buf[i]);
+            }
+            audioBase64 = btoa(bin);
+            audioMimeType = recording.blob.type || 'audio/webm';
+          } catch {
+            audioBase64 = undefined;
+          }
+        }
+
         const entry: HistoryEntry = {
           id: `hist-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           text: result.formatted_text,
           rawText: result.raw_text,
           audioBlob: recording.simulated ? null : recording.blob,
+          audioBase64,
+          audioMimeType,
           numWords: result.num_words,
           durationMs: recording.simulated
             ? result.duration_ms
@@ -957,13 +1023,32 @@ export const useFlowStore = create<FlowState>((set, get) => {
         };
 
         await saveHistoryEntry(entry);
+        const tauriInvoke =
+          typeof window !== 'undefined'
+            ? (window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke)
+            : undefined;
+        if (typeof tauriInvoke === 'function') {
+          void tauriInvoke('append_dataset_sample', {
+            jsonLine: JSON.stringify({
+              id: entry.id,
+              timestamp: entry.timestamp,
+              appTag: entry.appTag,
+              contextUsed: entry.contextUsed,
+              styleUsed: entry.styleUsed,
+              rawText: entry.rawText,
+              cleanedText: entry.text,
+              durationMs: entry.durationMs,
+              fillerRemovedCount: entry.fillerRemovedCount,
+            }),
+          }).catch(() => undefined);
+        }
 
         await platform.copyToClipboard(entry.text);
         const inserted = await platform.insertText(entry.text);
         playCompletionChime();
 
         set((s) => ({
-          history: [entry, ...s.history],
+          history: [entry, ...s.history].slice(0, MAX_HISTORY_ENTRIES),
           overlayState: 'done',
           activeStage: 'polish',
           overlayError: null,

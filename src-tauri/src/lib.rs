@@ -635,6 +635,49 @@ fn save_persisted_config(app: AppHandle, json: String) -> bool {
 }
 
 #[tauri::command]
+fn append_dataset_sample(json_line: String) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_line) else {
+        return false;
+    };
+    native_dictation::append_dataset_sample_record(&val);
+    true
+}
+
+#[tauri::command]
+fn consume_pending_history() -> Vec<String> {
+    let Some(path) = native_dictation::pending_history_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let _ = std::fs::remove_file(&path);
+    let audio_dir = native_dictation::pending_audio_dir();
+
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let mut val: serde_json::Value = serde_json::from_str(line).ok()?;
+            if let (Some(dir), Some(audio_file)) = (
+                audio_dir.as_ref(),
+                val.get("audioFile").and_then(|v| v.as_str()).map(str::to_string),
+            ) {
+                let wav_path = dir.join(&audio_file);
+                if let Ok(bytes) = std::fs::read(&wav_path) {
+                    val["audioBase64"] = serde_json::Value::String(native_dictation::encode_base64(&bytes));
+                }
+                let _ = std::fs::remove_file(&wav_path);
+            }
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("audioFile");
+            }
+            Some(val.to_string())
+        })
+        .collect()
+}
+
+#[tauri::command]
 fn frontend_ready(app: AppHandle, state: State<'_, AppRuntimeState>) {
     if state.pending_toggle.swap(false, Ordering::SeqCst) {
         trigger_global_toggle(&app);
@@ -747,6 +790,50 @@ fn get_active_app() -> Option<ActiveAppInfo> {
                 window_title: title,
                 platform: "linux",
             });
+        }
+
+        // Wayland (GNOME/Ubuntu) fallback via AT-SPI2 accessibility tree
+        const ATSPI_ACTIVE_PY: &str = r#"
+import gi
+gi.require_version('Atspi', '2.0')
+from gi.repository import Atspi
+skip = {'gnome-shell', 'mutter-x11-frames', 'gjs', 'crisptype'}
+desktop = Atspi.get_desktop(0)
+for i in range(desktop.get_child_count()):
+    app = desktop.get_child_at_index(i)
+    if not app:
+        continue
+    name = (app.get_name() or '').strip()
+    if not name or name.lower() in skip:
+        continue
+    for j in range(app.get_child_count()):
+        win = app.get_child_at_index(j)
+        if not win:
+            continue
+        st = win.get_state_set()
+        if st.contains(Atspi.StateType.ACTIVE) or st.contains(Atspi.StateType.FOCUSED):
+            print(f"{name}|{(win.get_name() or '').strip()}")
+            raise SystemExit(0)
+"#;
+        if let Some(raw) = Command::new("python3")
+            .args(["-c", ATSPI_ACTIVE_PY])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            let (app_name, window_title) = raw
+                .split_once('|')
+                .map(|(a, t)| (a.trim().to_string(), t.trim().to_string()))
+                .unwrap_or((raw, String::new()));
+            if !app_name.is_empty() || !window_title.is_empty() {
+                return Some(ActiveAppInfo {
+                    app_name,
+                    window_title,
+                    platform: "linux",
+                });
+            }
         }
         None
     }
@@ -1006,6 +1093,8 @@ pub fn run() {
             update_overlay_state,
             load_persisted_config,
             save_persisted_config,
+            append_dataset_sample,
+            consume_pending_history,
             frontend_ready,
             set_minimize_to_tray,
             set_autostart,
